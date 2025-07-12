@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MLB Batting Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: Arial; padding: 20px; background: #f5f5f5; }
+        table { width: 100%; border-collapse: collapse; background: #fff; margin-bottom:40px; }
+        th, td { padding: 8px; text-align: center; border: 1px solid #ccc; }
+        th { background: #004687; color: #fff; }
+        tr:nth-child(even) { background: #f0f0f0; }
+        form { margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <h1>MLB Starting Batters – Stats</h1>
+    <form method="get">
+        <button type="submit">🔄 Refresh</button>
+        <label>Team: <select name="team">
+            <option value="">All Teams</option>
+            {% for t in team_names %}
+              <option {% if t==selected_team %}selected{% endif %}>{{t}}</option>
+            {% endfor %}
+        </select></label>
+        <label>Player: <input name="search" value="{{search}}"></label>
+        <button type="submit">Filter</button>
+    </form>
+    <table>
+        <thead>
+          {% set nd = 'desc' if sort_dir=='asc' else 'asc' %}
+          <tr>
+            <th><a href="?sort=name&dir={{nd}}">Player</a></th>
+            <th><a href="?sort=team&dir={{nd}}">Team</a></th>
+            <th><a href="?sort=l5&dir={{nd}}">Last 5 AVG</a></th>
+            <th><a href="?sort=l10&dir={{nd}}">Last 10 AVG</a></th>
+            <th><a href="?sort=season&dir={{nd}}">Season AVG</a></th>
+            <th><a href="?sort=ab&dir={{nd}}">AB</a></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for p in players %}
+            <tr>
+              <td>{{p.name}}</td><td>{{p.team}}</td>
+              <td>{{p.l5}}</td><td>{{p.l10}}</td>
+              <td>{{p.season}}</td><td>{{p.ab}}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+    </table>
+
+    <h2>Last 5 Games vs Season AVG</h2>
+    <canvas id="l5Chart" height="300"></canvas>
+    <h2>Last 10 Games vs Season AVG</h2>
+    <canvas id="l10Chart" height="300"></canvas>
+
+    <script>
+      const players = {{players | tojson }};
+      function color(d) {
+        const v = Math.min(Math.abs(d*1000),100);
+        return d>0? `rgba(255,0,0,${0.2+v/200})`:
+                   `rgba(0,0,255,${0.2+v/200})`;
+      }
+      function makeChart(id, key) {
+        const ctx = document.getElementById(id).getContext('2d');
+        new Chart(ctx, {
+          type:'bar',
+          data:{
+            labels: players.map(p=>p.name),
+            datasets:[{data: players.map(p=>p[key]), backgroundColor: players.map(p=>color(p[key]))}]
+          },
+          options:{
+            indexAxis:'y',
+            scales:{x:{title:{display:true,text:'Δ AVG (Season -> Recent)'},beginAtZero:true}},
+            plugins:{legend:{display:false}}
+          }
+        });
+      }
+      makeChart('l5Chart','diff_l5');
+      makeChart('l10Chart','diff_l10');
+    </script>
+</body>
+</html>
