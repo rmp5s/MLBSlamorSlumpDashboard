@@ -313,4 +313,5 @@ if __name__ == "__main__":
     threading.Thread(target=lambda: asyncio.run(load_all_players()), daemon=True).start()
     threading.Thread(target=blown_loop, daemon=True).start()
 
-    app.run(host="0.0.0.0", port=5000, debug=True)
+if __name__ == "__main__":
+    app.run()
