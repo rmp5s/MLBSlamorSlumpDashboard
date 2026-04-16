@@ -194,13 +194,12 @@ def blown_loop():
         time.sleep(21600)
 
 # =========================================================
-# UI (FULL RESTORED DASHBOARD)
+# UI
 # =========================================================
 HOME_HTML = """
 <html>
 <head>
 <title>MLB Dashboard</title>
-
 <style>
 body { font-family: Arial; margin: 20px; }
 table { border-collapse: collapse; width: 100%; }
@@ -208,14 +207,11 @@ th, td { border: 1px solid #ddd; padding: 6px; cursor: pointer; }
 th { background: #f4f4f4; }
 </style>
 </head>
-
 <body>
 
 <h2>MLB Batting Dashboard</h2>
 
-<p>
-<a href="/blown_leads" target="_blank">Blown Leads</a>
-</p>
+<p><a href="/blown_leads" target="_blank">Blown Leads</a></p>
 
 <table id="tbl">
 <thead>
@@ -298,20 +294,27 @@ def blown_leads_page():
     ])
 
     return render_template_string(f"""
+    <html>
+    <body>
     <h2>Blown Leads</h2>
     <a href="/">Back</a>
     <table border=1>
     <tr><th>Rank</th><th>Team</th><th>Blown Leads</th></tr>
     {rows}
     </table>
+    </body>
+    </html>
     """)
 
 # =========================================================
-# START
+# SAFE STARTUP (RENDER + LOCAL)
 # =========================================================
-if __name__ == "__main__":
+def start_background_jobs():
     threading.Thread(target=lambda: asyncio.run(load_all_players()), daemon=True).start()
     threading.Thread(target=blown_loop, daemon=True).start()
+
+# Start jobs for BOTH Gunicorn and local runs
+start_background_jobs()
 
 if __name__ == "__main__":
     app.run()
