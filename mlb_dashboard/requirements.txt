@@ -1,2 +1,4 @@
-Flask
+flask
+aiohttp
 requests
+gunicorn
