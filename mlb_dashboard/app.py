@@ -18,7 +18,7 @@ cached_players = []
 blown_leads_cache = {}
 
 # =========================================================
-# HELPERS
+# DATA
 # =========================================================
 async def fetch_json(session, url):
     async with session.get(url) as resp:
@@ -33,62 +33,39 @@ def compute_avg(games, n):
         ab += int(stat.get("atBats", 0))
     return round(hits / ab, 3) if ab > 0 else 0.0
 
-# =========================================================
-# PLAYER LOADING
-# =========================================================
 async def fetch_player_data(session, player, team_abbr):
-    try:
-        pid = player["person"]["id"]
-        name = player["person"]["fullName"]
+    pid = player["person"]["id"]
+    name = player["person"]["fullName"]
 
-        season = await fetch_json(
-            session,
-            f"{MLB_API_BASE}/people/{pid}/stats?stats=season&season=2026"
-        )
+    season = await fetch_json(session, f"{MLB_API_BASE}/people/{pid}/stats?stats=season&season=2026")
 
-        splits = season.get("stats", [{}])[0].get("splits", [])
-        stat = splits[0].get("stat", {}) if splits else {}
+    splits = season.get("stats", [{}])[0].get("splits", [])
+    stat = splits[0].get("stat", {}) if splits else {}
 
-        season_avg = float(stat.get("avg", 0))
-        ab = int(stat.get("atBats", 0))
+    season_avg = float(stat.get("avg", 0))
+    ab = int(stat.get("atBats", 0))
 
-        game_log = await fetch_json(
-            session,
-            f"{MLB_API_BASE}/people/{pid}/stats?stats=gameLog&season=2026"
-        )
+    game_log = await fetch_json(session, f"{MLB_API_BASE}/people/{pid}/stats?stats=gameLog&season=2026")
+    games = game_log.get("stats", [{}])[0].get("splits", [])
 
-        games = game_log.get("stats", [{}])[0].get("splits", [])
-
-        l5 = compute_avg(games, 5)
-        l10 = compute_avg(games, 10)
-
-        return {
-            "name": name,
-            "team": team_abbr,
-            "season_avg": season_avg,
-            "l5_avg": l5,
-            "l10_avg": l10,
-            "ab": ab
-        }
-
-    except Exception as e:
-        logging.error(e)
-        return None
+    return {
+        "name": name,
+        "team": team_abbr,
+        "season_avg": season_avg,
+        "l5_avg": compute_avg(games, 5),
+        "l10_avg": compute_avg(games, 10),
+        "ab": ab
+    }
 
 async def load_all_players():
     global cached_players
-
-    logging.info("STARTING PLAYER LOAD...")
 
     async with aiohttp.ClientSession() as session:
         teams = (await fetch_json(session, f"{MLB_API_BASE}/teams?sportId=1")).get("teams", [])
         players = []
 
         for team in teams:
-            team_id = team["id"]
-            abbr = team["abbreviation"]
-
-            roster = (await fetch_json(session, f"{MLB_API_BASE}/teams/{team_id}/roster")).get("roster", [])
+            roster = (await fetch_json(session, f"{MLB_API_BASE}/teams/{team['id']}/roster")).get("roster", [])
 
             batters = [
                 p for p in roster
@@ -96,15 +73,13 @@ async def load_all_players():
                 ("1B","2B","3B","SS","LF","CF","RF","C","DH")
             ]
 
-            tasks = [fetch_player_data(session, p, abbr) for p in batters]
+            tasks = [fetch_player_data(session, p, team["abbreviation"]) for p in batters]
             results = await asyncio.gather(*tasks)
 
-            for r in results:
-                if r:
-                    players.append(r)
+            players.extend([r for r in results if r])
 
         cached_players = players
-        logging.info(f"LOADED {len(players)} PLAYERS")
+        logging.info(f"Loaded {len(players)} players")
 
 # =========================================================
 # API
@@ -114,33 +89,91 @@ def api_player_stats():
     return jsonify({"players": cached_players})
 
 # =========================================================
-# BLOWN LEADS (unchanged)
-# =========================================================
-def compute_blown_leads():
-    return {}
-
-def blown_loop():
-    global blown_leads_cache
-    while True:
-        blown_leads_cache = compute_blown_leads()
-        time.sleep(21600)
-
-# =========================================================
-# UI
+# UI (RESTORED FULL DASHBOARD)
 # =========================================================
 HOME_HTML = """
+<html>
+<head>
+<title>MLB Dashboard</title>
+
+<style>
+body { font-family: Arial; margin: 20px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #ddd; padding: 6px; cursor: pointer; }
+th { background: #f4f4f4; }
+</style>
+</head>
+
+<body>
+
 <h2>MLB Batting Dashboard</h2>
-<a href="/blown_leads">Blown Leads</a>
-<pre id="data"></pre>
+
+<p><a href="/blown_leads" target="_blank">Blown Leads</a></p>
+
+<table>
+<thead>
+<tr>
+<th onclick="sort('name')">Name</th>
+<th onclick="sort('team')">Team</th>
+<th onclick="sort('season_avg')">Season AVG</th>
+<th onclick="sort('l5_avg')">L5 AVG</th>
+<th onclick="sort('l10_avg')">L10 AVG</th>
+<th onclick="sort('ab')">AB</th>
+</tr>
+</thead>
+<tbody id="body"></tbody>
+</table>
 
 <script>
-async function load() {
-    let res = await fetch("/api/player_stats");
-    let data = await res.json();
-    document.getElementById("data").innerText = JSON.stringify(data, null, 2);
+let sortField = "season_avg";
+let dir = "desc";
+
+function color(val, min, max) {
+    let ratio = (val - min) / (max - min + 0.0001);
+    let r = Math.floor(255 * ratio);
+    let b = Math.floor(255 * (1 - ratio));
+    return `rgb(${r},0,${b})`;
 }
+
+function sort(field) {
+    sortField = field;
+    dir = dir === "asc" ? "desc" : "asc";
+    load();
+}
+
+async function load() {
+    const res = await fetch("/api/player_stats");
+    const data = await res.json();
+
+    let players = data.players;
+
+    let l5 = players.map(p => p.l5_avg);
+    let l10 = players.map(p => p.l10_avg);
+
+    let l5min = Math.min(...l5), l5max = Math.max(...l5);
+    let l10min = Math.min(...l10), l10max = Math.max(...l10);
+
+    let body = document.getElementById("body");
+    body.innerHTML = "";
+
+    players.forEach(p => {
+        body.innerHTML += `
+        <tr>
+            <td>${p.name}</td>
+            <td>${p.team}</td>
+            <td>${p.season_avg}</td>
+            <td style="background:${color(p.l5_avg,l5min,l5max)}">${p.l5_avg}</td>
+            <td style="background:${color(p.l10_avg,l10min,l10max)}">${p.l10_avg}</td>
+            <td>${p.ab}</td>
+        </tr>`;
+    });
+}
+
 load();
 </script>
+
+</body>
+</html>
 """
 
 @app.route("/")
@@ -148,23 +181,19 @@ def home():
     return render_template_string(HOME_HTML)
 
 # =========================================================
-# 🔥 CRITICAL FIX: START THREADS ON FIRST REQUEST
+# BLOWN LEADS (kept minimal placeholder-safe)
 # =========================================================
-started = False
+@app.route("/blown_leads")
+def blown():
+    return "<h2>Blown Leads Coming Back Next Step</h2>"
 
-@app.before_request
-def start_once():
-    global started
-    if not started:
-        started = True
-        logging.info("Starting background jobs...")
+# =========================================================
+# STARTUP (Render-safe)
+# =========================================================
+def start():
+    threading.Thread(target=lambda: asyncio.run(load_all_players()), daemon=True).start()
 
-        threading.Thread(
-            target=lambda: asyncio.run(load_all_players()),
-            daemon=True
-        ).start()
+start()
 
-        threading.Thread(
-            target=blown_loop,
-            daemon=True
-        ).start()
+if __name__ == "__main__":
+    app.run()
