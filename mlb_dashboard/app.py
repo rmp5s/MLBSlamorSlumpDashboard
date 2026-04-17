@@ -184,35 +184,50 @@ HOME_HTML = """
 <title>MLB Dashboard</title>
 
 <style>
-body { font-family: Arial; margin: 20px; background:#d3d3d3; color:white; }
-table { border-collapse: collapse; width: 100%; background:white; color:black; }
-th, td { border: 1px solid #ddd; padding: 6px; }
-th { background: #444; color:white; }
-a { color: blue; }
+body { font-family: Arial; margin: 20px; background:#181a1b; color:white; }
+table { border-collapse: collapse; width: 100%; background:#181a1b; color:white; }
+th, td { border: 1px solid #333; padding: 6px; }
+th { background: #222; cursor:pointer; }
+input { padding:5px; margin-bottom:10px; width:300px; }
 </style>
 </head>
 
 <body>
 
-<h2>MLB Batting Dashboard v1.1</h2>
+<h2>MLB Batting Dashboard v1.2</h2>
 
 <p><a href="/blown_leads" target="_blank">Blown Leads</a></p>
+
+<input type="text" id="search" placeholder="Search player or team..." oninput="load()">
 
 <table>
 <thead>
 <tr>
-<th>Name</th>
-<th>Team</th>
-<th>Season AVG</th>
-<th>L5 AVG</th>
-<th>L10 AVG</th>
-<th>AB</th>
+<th onclick="setSort('name')">Name</th>
+<th onclick="setSort('team')">Team</th>
+<th onclick="setSort('season_avg')">Season AVG</th>
+<th onclick="setSort('l5_avg')">L5 AVG</th>
+<th onclick="setSort('l10_avg')">L10 AVG</th>
+<th onclick="setSort('ab')">AB</th>
 </tr>
 </thead>
 <tbody id="body"></tbody>
 </table>
 
 <script>
+let sortField = "season_avg";
+let sortDir = "desc";
+
+function setSort(field){
+    if(sortField === field){
+        sortDir = sortDir === "asc" ? "desc" : "asc";
+    } else {
+        sortField = field;
+        sortDir = "desc";
+    }
+    load();
+}
+
 function color(val, min, max) {
     let ratio = (val - min) / (max - min + 0.0001);
     let r = Math.floor(255 * ratio);
@@ -220,38 +235,50 @@ function color(val, min, max) {
     return `rgb(${r},0,${b})`;
 }
 
-async function load() {
+async function load(){
     const res = await fetch("/api/player_stats");
     const data = await res.json();
-
     let players = data.players;
-    let body = document.getElementById("body");
 
-    if (!players || players.length === 0) {
-        body.innerHTML = "<tr><td colspan='6'>Loading data...</td></tr>";
-        setTimeout(load, 2000);
+    let search = document.getElementById("search").value.toLowerCase();
+    players = players.filter(p =>
+        p.name.toLowerCase().includes(search) ||
+        p.team.toLowerCase().includes(search)
+    );
+
+    if(players.length === 0){
+        document.getElementById("body").innerHTML = "<tr><td colspan='6'>Loading or no results...</td></tr>";
+        setTimeout(load,2000);
         return;
     }
 
-    let l5 = players.map(p => p.l5_avg);
-    let l10 = players.map(p => p.l10_avg);
+    players.sort((a,b)=>{
+        let v1 = a[sortField];
+        let v2 = b[sortField];
+        if(typeof v1 === "string") return sortDir==="asc" ? v1.localeCompare(v2) : v2.localeCompare(v1);
+        return sortDir==="asc" ? v1-v2 : v2-v1;
+    });
 
-    let l5min = Math.min(...l5), l5max = Math.max(...l5);
-    let l10min = Math.min(...l10), l10max = Math.max(...l10);
+    let l5 = players.map(p=>p.l5_avg);
+    let l10 = players.map(p=>p.l10_avg);
 
-    body.innerHTML = "";
+    let l5min=Math.min(...l5), l5max=Math.max(...l5);
+    let l10min=Math.min(...l10), l10max=Math.max(...l10);
 
-    players.forEach(p => {
-        body.innerHTML += `
+    let body="";
+    players.forEach(p=>{
+        body+=`
         <tr>
-            <td>${p.name}</td>
-            <td>${p.team}</td>
-            <td>${p.season_avg}</td>
-            <td style="background:${color(p.l5_avg,l5min,l5max)}">${p.l5_avg}</td>
-            <td style="background:${color(p.l10_avg,l10min,l10max)}">${p.l10_avg}</td>
-            <td>${p.ab}</td>
+        <td>${p.name}</td>
+        <td>${p.team}</td>
+        <td>${p.season_avg}</td>
+        <td style="background:${color(p.l5_avg,l5min,l5max)}">${p.l5_avg}</td>
+        <td style="background:${color(p.l10_avg,l10min,l10max)}">${p.l10_avg}</td>
+        <td>${p.ab}</td>
         </tr>`;
     });
+
+    document.getElementById("body").innerHTML=body;
 }
 
 load();
@@ -264,53 +291,42 @@ load();
 BLOWN_HTML = """
 <html>
 <head>
-<title>Blown Leads</title>
-
 <style>
-body { font-family: Arial; margin: 20px; background:#d3d3d3; color:white; }
-table { border-collapse: collapse; width: 50%; background:white; color:black; }
-th, td { border: 1px solid #ddd; padding: 6px; }
-th { background: #444; color:white; }
+body { font-family: Arial; margin: 20px; background:#181a1b; color:white; }
+table { border-collapse: collapse; width: 50%; background:#181a1b; color:white; }
+th, td { border: 1px solid #333; padding: 6px; }
+th { background: #222; }
 </style>
 </head>
 
 <body>
-
-<h2>MLB Blown Leads v1.1</h2>
-<p><a href="/">Back</a></p>
+<h2>MLB Blown Leads v1.2</h2>
+<a href="/">Back</a>
 
 <table>
-<thead>
-<tr><th>Rank</th><th>Team</th><th>Blown Leads</th></tr>
-</thead>
+<thead><tr><th>Rank</th><th>Team</th><th>Blown Leads</th></tr></thead>
 <tbody id="body"></tbody>
 </table>
 
 <script>
-async function load() {
+async function load(){
     const res = await fetch("/api/blown_leads");
     const data = await res.json();
 
-    let body = document.getElementById("body");
-
     let entries = Object.entries(data);
 
-    if (entries.length === 0) {
-        body.innerHTML = "<tr><td colspan='3'>Loading data...</td></tr>";
-        setTimeout(load, 2000);
+    if(entries.length===0){
+        document.getElementById("body").innerHTML="<tr><td colspan='3'>Loading...</td></tr>";
+        setTimeout(load,2000);
         return;
     }
 
-    body.innerHTML = "";
-
-    entries.forEach((e, i) => {
-        body.innerHTML += `
-        <tr>
-            <td>${i+1}</td>
-            <td>${e[0]}</td>
-            <td>${e[1]}</td>
-        </tr>`;
+    let body="";
+    entries.forEach((e,i)=>{
+        body+=`<tr><td>${i+1}</td><td>${e[0]}</td><td>${e[1]}</td></tr>`;
     });
+
+    document.getElementById("body").innerHTML=body;
 }
 
 load();
@@ -329,24 +345,15 @@ def blown_page():
     return render_template_string(BLOWN_HTML)
 
 # =========================================================
-# STARTUP (RENDER SAFE)
+# STARTUP
 # =========================================================
 @app.before_request
 def start_once():
     global started
     if not started:
         started = True
-        logging.info("Starting background jobs...")
-
-        threading.Thread(
-            target=lambda: asyncio.run(load_all_players()),
-            daemon=True
-        ).start()
-
-        threading.Thread(
-            target=blown_loop,
-            daemon=True
-        ).start()
+        threading.Thread(target=lambda: asyncio.run(load_all_players()), daemon=True).start()
+        threading.Thread(target=blown_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run()
