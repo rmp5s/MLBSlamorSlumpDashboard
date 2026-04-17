@@ -41,7 +41,6 @@ def load_cache():
             data = json.load(f)
             cached_players = data.get("players", [])
             blown_leads_cache = data.get("blown", {})
-            logging.info("Cache loaded")
 
 # =========================================================
 # HELPERS
@@ -102,7 +101,6 @@ async def load_players():
 
         cached_players = players
         save_cache()
-        logging.info("Players loaded")
 
 # =========================================================
 # BLOWN LEADS
@@ -162,7 +160,7 @@ def api_blown():
     return jsonify(blown_leads_cache)
 
 # =========================================================
-# CSV (FIXED)
+# CSV
 # =========================================================
 @app.route("/export")
 def export():
@@ -173,13 +171,13 @@ def export():
         writer.writerow([p["name"],p["team"],p["season_avg"],p["l5_avg"],p["l10_avg"],p["ab"]])
 
     output = BytesIO()
-    output.write(si.getvalue().encode("utf-8"))
+    output.write(si.getvalue().encode())
     output.seek(0)
 
     return send_file(output, mimetype="text/csv", as_attachment=True, download_name="mlb.csv")
 
 # =========================================================
-# UI (FIXED DROPDOWNS)
+# UI
 # =========================================================
 HOME_HTML = """
 <html>
@@ -196,7 +194,14 @@ a { color:#66ccff; }
 
 <body>
 
-<h2>MLB Batting Dashboard v2.4</h2>
+<h2>MLB Batting Dashboard v2.5</h2>
+
+<p style="max-width:900px; line-height:1.4;">
+Welcome to the MLB Slam Or Slump dashboard!! Here you can see batting averages for players overall,
+over their last 5 games and last 10 games. Click the column headers to sort and the dropdowns to
+select teams, divisions, etc. There's also a link to the Blown Leads page at the top.
+Lemme know how it works!! --Brent
+</p>
 
 <a href="/blown">Blown Leads</a><br>
 
@@ -237,7 +242,10 @@ function sort(f){
 
 function exportCSV(){ window.location="/export"; }
 
-function clearSelections(){ selected=[]; load(); }
+function clearSelections(){
+    selected=[];
+    load();
+}
 
 function color(v,min,max){
     let r=(v-min)/(max-min+0.0001);
@@ -318,14 +326,67 @@ init();
 </html>
 """
 
-BLOWN_HTML = """<html><body><h2>MLB Blown Leads v2.4</h2><a href="/">Back</a><table border=1 id=tbl></table>
+BLOWN_HTML = """
+<html>
+<head>
+<style>
+body { background:#181a1b; color:white; font-family:Arial; }
+table { border-collapse:collapse; width:50%; }
+th,td { border:1px solid #333; padding:6px; }
+th { cursor:pointer; background:#222; }
+a { color:#66ccff; }
+</style>
+</head>
+
+<body>
+
+<h2>MLB Blown Leads v2.5</h2>
+
+<a href="/">Back</a>
+
+<table>
+<thead>
+<tr>
+<th onclick="sort('team')">Team</th>
+<th onclick="sort('value')">Blown Leads</th>
+</tr>
+</thead>
+<tbody id="body"></tbody>
+</table>
+
 <script>
-fetch('/api/blown').then(r=>r.json()).then(d=>{
-let rows=Object.entries(d);
-tbl.innerHTML="<tr><th>Team</th><th>Blown Leads</th></tr>"+
-rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("");
-});
-</script></body></html>"""
+let data=[],field="value",dir="desc";
+
+function sort(f){
+    if(field===f) dir=dir==="asc"?"desc":"asc";
+    else {field=f;dir="desc";}
+    render();
+}
+
+async function init(){
+    let res=await fetch("/api/blown");
+    let raw=await res.json();
+    data=Object.entries(raw).map(([k,v])=>({team:k,value:v}));
+    render();
+}
+
+function render(){
+    data.sort((a,b)=>{
+        let v1=a[field],v2=b[field];
+        if(typeof v1==="string") return dir==="asc"?v1.localeCompare(v2):v2.localeCompare(v1);
+        return dir==="asc"?v1-v2:v2-v1;
+    });
+
+    document.getElementById("body").innerHTML =
+        data.map(r=>`<tr><td>${r.team}</td><td>${r.value}</td></tr>`).join("");
+}
+
+init();
+</script>
+
+</body>
+</html>
+"""
 
 @app.route("/")
 def home():
