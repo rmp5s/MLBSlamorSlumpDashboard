@@ -199,11 +199,10 @@ a { color:#66ccff; }
 <p style="max-width:900px; line-height:1.4;">
 Welcome to the MLB Slam Or Slump dashboard!! Here you can see batting averages for players overall,
 over their last 5 games and last 10 games. Click the column headers to sort and the dropdowns to
-select teams, divisions, etc. There's also a link to the Blown Leads page at the top.
+select team, division and/or league, search players or make your own custom team. 
+There's also a link to the Blown Leads page right here:  <a href="/blown">Blown Leads</a><br>
 Lemme know how it works!! --Brent
 </p>
-
-<a href="/blown">Blown Leads</a><br>
 
 <button onclick="exportCSV()">Export CSV</button>
 <button onclick="clearSelections()">CLEAR SELECTIONS</button><br>
