@@ -189,7 +189,7 @@ th { background: #f4f4f4; }
 
 <body>
 
-<h2>MLB Batting Dashboard</h2>
+<h2>MLB Batting Dashboard v1.0</h2>
 
 <p><a href="/blown_leads" target="_blank">Blown Leads</a></p>
 
