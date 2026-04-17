@@ -22,7 +22,7 @@ blown_leads_cache = {}
 started = False
 
 # =========================================================
-# CACHE (INSTANT LOAD)
+# CACHE
 # =========================================================
 def save_cache():
     with open(CACHE_FILE, "w") as f:
@@ -37,8 +37,8 @@ def load_cache():
         with open(CACHE_FILE) as f:
             data = json.load(f)
             cached_players = data.get("players", [])
-            blown_leads_cache = data.get("blown", [])
-            logging.info("Loaded cache from disk")
+            blown_leads_cache = data.get("blown", {})
+            logging.info("Loaded cache")
 
 # =========================================================
 # HELPERS
@@ -99,10 +99,10 @@ async def load_players():
         logging.info("Players refreshed")
 
 # =========================================================
-# BLOWN LEADS
+# BLOWN LEADS (kept simple but working)
 # =========================================================
 def compute_blown():
-    return blown_leads_cache  # keep simple for now
+    return blown_leads_cache
 
 def blown_loop():
     global blown_leads_cache
@@ -135,17 +135,12 @@ def export():
         writer.writerow([p["name"], p["team"], p["season_avg"], p["l5_avg"], p["l10_avg"], p["ab"]])
 
     output = StringIO(si.getvalue())
-    return send_file(
-        output,
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name="mlb_stats.csv"
-    )
+    return send_file(output, mimetype="text/csv", as_attachment=True, download_name="mlb_stats.csv")
 
 # =========================================================
 # UI
 # =========================================================
-HTML = """
+HOME_HTML = """
 <html>
 <head>
 <style>
@@ -154,29 +149,23 @@ table { border-collapse:collapse; width:100%; }
 th,td { border:1px solid #333; padding:6px; }
 th { cursor:pointer; background:#222; }
 select,input,button { margin:5px; padding:5px; }
+a { color:#66ccff; }
 </style>
 </head>
 
 <body>
 
-<h2>MLB Batting Dashboard v2.0</h2>
+<h2>MLB Batting Dashboard v2.1</h2>
+
+<a href="/blown">Blown Leads</a>
+
+<br><br>
 
 <button onclick="exportCSV()">Export CSV</button>
 
 <br>
 
 <select id="team"></select>
-<select id="league">
-<option value="">All Leagues</option>
-<option>AL</option>
-<option>NL</option>
-</select>
-<select id="division">
-<option value="">All Divisions</option>
-<option>East</option>
-<option>Central</option>
-<option>West</option>
-</select>
 
 <input id="search" placeholder="Search players..." oninput="load()">
 
@@ -208,6 +197,13 @@ function exportCSV(){
     window.location="/export";
 }
 
+function color(val,min,max){
+    let ratio=(val-min)/(max-min+0.0001);
+    let r=Math.floor(255*ratio);
+    let b=Math.floor(255*(1-ratio));
+    return `rgb(${r},0,${b})`;
+}
+
 async function init(){
     let res=await fetch("/api/players");
     data=await res.json();
@@ -230,19 +226,31 @@ function load(){
         (p.name.toLowerCase().includes(search)||p.team.toLowerCase().includes(search))
     );
 
+    if(rows.length===0){
+        document.getElementById("body").innerHTML="<tr><td colspan='6'>Loading...</td></tr>";
+        setTimeout(load,2000);
+        return;
+    }
+
     rows.sort((a,b)=>{
         let v1=a[field],v2=b[field];
         if(typeof v1==="string") return dir==="asc"?v1.localeCompare(v2):v2.localeCompare(v1);
         return dir==="asc"?v1-v2:v2-v1;
     });
 
+    let l5=rows.map(p=>p.l5_avg);
+    let l10=rows.map(p=>p.l10_avg);
+
+    let l5min=Math.min(...l5), l5max=Math.max(...l5);
+    let l10min=Math.min(...l10), l10max=Math.max(...l10);
+
     document.getElementById("body").innerHTML=
         rows.map(p=>`<tr>
         <td>${p.name}</td>
         <td>${p.team}</td>
         <td>${p.season_avg}</td>
-        <td>${p.l5_avg}</td>
-        <td>${p.l10_avg}</td>
+        <td style="background:${color(p.l5_avg,l5min,l5max)}">${p.l5_avg}</td>
+        <td style="background:${color(p.l10_avg,l10min,l10max)}">${p.l10_avg}</td>
         <td>${p.ab}</td>
         </tr>`).join("");
 }
@@ -254,9 +262,72 @@ init();
 </html>
 """
 
+BLOWN_HTML = """
+<html>
+<head>
+<style>
+body { background:#181a1b; color:white; font-family:Arial; }
+table { border-collapse:collapse; width:50%; }
+th,td { border:1px solid #333; padding:6px; }
+th { cursor:pointer; background:#222; }
+a { color:#66ccff; }
+</style>
+</head>
+
+<body>
+
+<h2>MLB Blown Leads v2.1</h2>
+
+<a href="/">Back</a>
+
+<table>
+<thead>
+<tr>
+<th onclick="sort('team')">Team</th>
+<th onclick="sort('value')">Blown Leads</th>
+</tr>
+</thead>
+<tbody id="body"></tbody>
+</table>
+
+<script>
+let data=[],field="value",dir="desc";
+
+function sort(f){
+    if(field===f) dir=dir==="asc"?"desc":"asc";
+    else {field=f;dir="desc";}
+    render();
+}
+
+async function init(){
+    let res=await fetch("/api/blown");
+    let raw=await res.json();
+
+    data=Object.entries(raw).map(([k,v])=>({team:k,value:v}));
+    render();
+}
+
+function render(){
+    data.sort((a,b)=>dir==="asc"?a[field]-b[field]:b[field]-a[field]);
+
+    document.getElementById("body").innerHTML=
+        data.map((r,i)=>`<tr><td>${r.team}</td><td>${r.value}</td></tr>`).join("");
+}
+
+init();
+</script>
+
+</body>
+</html>
+"""
+
 @app.route("/")
 def home():
-    return render_template_string(HTML)
+    return render_template_string(HOME_HTML)
+
+@app.route("/blown")
+def blown():
+    return render_template_string(BLOWN_HTML)
 
 # =========================================================
 # STARTUP
