@@ -100,13 +100,6 @@ async def load_all_players():
         logging.info(f"Loaded {len(players)} players")
 
 # =========================================================
-# API
-# =========================================================
-@app.route("/api/player_stats")
-def api_player_stats():
-    return jsonify({"players": cached_players})
-
-# =========================================================
 # BLOWN LEADS
 # =========================================================
 def get_all_games(season=2026):
@@ -172,6 +165,17 @@ def blown_loop():
         time.sleep(21600)
 
 # =========================================================
+# API
+# =========================================================
+@app.route("/api/player_stats")
+def api_player_stats():
+    return jsonify({"players": cached_players})
+
+@app.route("/api/blown_leads")
+def api_blown_leads():
+    return jsonify(blown_leads_cache)
+
+# =========================================================
 # UI
 # =========================================================
 HOME_HTML = """
@@ -180,16 +184,17 @@ HOME_HTML = """
 <title>MLB Dashboard</title>
 
 <style>
-body { font-family: Arial; margin: 20px; }
-table { border-collapse: collapse; width: 100%; }
-th, td { border: 1px solid #ddd; padding: 6px; cursor: pointer; }
-th { background: #f4f4f4; }
+body { font-family: Arial; margin: 20px; background:#d3d3d3; color:white; }
+table { border-collapse: collapse; width: 100%; background:white; color:black; }
+th, td { border: 1px solid #ddd; padding: 6px; }
+th { background: #444; color:white; }
+a { color: blue; }
 </style>
 </head>
 
 <body>
 
-<h2>MLB Batting Dashboard v1.0</h2>
+<h2>MLB Batting Dashboard v1.1</h2>
 
 <p><a href="/blown_leads" target="_blank">Blown Leads</a></p>
 
@@ -256,29 +261,72 @@ load();
 </html>
 """
 
+BLOWN_HTML = """
+<html>
+<head>
+<title>Blown Leads</title>
+
+<style>
+body { font-family: Arial; margin: 20px; background:#d3d3d3; color:white; }
+table { border-collapse: collapse; width: 50%; background:white; color:black; }
+th, td { border: 1px solid #ddd; padding: 6px; }
+th { background: #444; color:white; }
+</style>
+</head>
+
+<body>
+
+<h2>MLB Blown Leads v1.1</h2>
+<p><a href="/">Back</a></p>
+
+<table>
+<thead>
+<tr><th>Rank</th><th>Team</th><th>Blown Leads</th></tr>
+</thead>
+<tbody id="body"></tbody>
+</table>
+
+<script>
+async function load() {
+    const res = await fetch("/api/blown_leads");
+    const data = await res.json();
+
+    let body = document.getElementById("body");
+
+    let entries = Object.entries(data);
+
+    if (entries.length === 0) {
+        body.innerHTML = "<tr><td colspan='3'>Loading data...</td></tr>";
+        setTimeout(load, 2000);
+        return;
+    }
+
+    body.innerHTML = "";
+
+    entries.forEach((e, i) => {
+        body.innerHTML += `
+        <tr>
+            <td>${i+1}</td>
+            <td>${e[0]}</td>
+            <td>${e[1]}</td>
+        </tr>`;
+    });
+}
+
+load();
+</script>
+
+</body>
+</html>
+"""
+
 @app.route("/")
 def home():
     return render_template_string(HOME_HTML)
 
 @app.route("/blown_leads")
-def blown_leads_page():
-    rows = "".join([
-        f"<tr><td>{i+1}</td><td>{t}</td><td>{v}</td></tr>"
-        for i, (t, v) in enumerate(blown_leads_cache.items())
-    ])
-
-    return render_template_string(f"""
-    <html>
-    <body>
-    <h2>Blown Leads</h2>
-    <a href="/">Back</a>
-    <table border=1>
-    <tr><th>Rank</th><th>Team</th><th>Blown Leads</th></tr>
-    {rows}
-    </table>
-    </body>
-    </html>
-    """)
+def blown_page():
+    return render_template_string(BLOWN_HTML)
 
 # =========================================================
 # STARTUP (RENDER SAFE)
