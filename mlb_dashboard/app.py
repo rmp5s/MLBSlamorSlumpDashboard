@@ -22,7 +22,6 @@ CACHE_FILE = "cache.json"
 
 cached_players = []
 blown_leads_cache = {}
-teams_info = {}
 started = False
 
 # =========================================================
@@ -32,18 +31,16 @@ def save_cache():
     with open(CACHE_FILE, "w") as f:
         json.dump({
             "players": cached_players,
-            "blown": blown_leads_cache,
-            "teams": teams_info
+            "blown": blown_leads_cache
         }, f)
 
 def load_cache():
-    global cached_players, blown_leads_cache, teams_info
+    global cached_players, blown_leads_cache
     if os.path.exists(CACHE_FILE):
         with open(CACHE_FILE) as f:
             data = json.load(f)
             cached_players = data.get("players", [])
             blown_leads_cache = data.get("blown", {})
-            teams_info = data.get("teams", {})
             logging.info("Cache loaded")
 
 # =========================================================
@@ -59,7 +56,7 @@ def compute_avg(games, n):
     return round(hits / ab, 3) if ab > 0 else 0.0
 
 # =========================================================
-# LOAD PLAYERS + TEAM INFO
+# PLAYERS
 # =========================================================
 async def fetch_player(session, player, team):
     try:
@@ -86,18 +83,13 @@ async def fetch_player(session, player, team):
         return None
 
 async def load_players():
-    global cached_players, teams_info
+    global cached_players
 
     async with aiohttp.ClientSession() as session:
         teams = (await fetch_json(session, f"{MLB_API_BASE}/teams?sportId=1"))["teams"]
 
         players = []
         for t in teams:
-            teams_info[t["abbreviation"]] = {
-                "league": t["league"]["name"],
-                "division": t["division"]["name"]
-            }
-
             roster = (await fetch_json(session, f"{MLB_API_BASE}/teams/{t['id']}/roster"))["roster"]
 
             batters = [p for p in roster if p["position"]["abbreviation"] in
@@ -148,6 +140,7 @@ def compute_blown():
             if a_lead and a<h: blown[away]+=1
         except:
             pass
+
     return dict(sorted(blown.items(), key=lambda x:x[1], reverse=True))
 
 def blown_loop():
@@ -169,21 +162,21 @@ def api_blown():
     return jsonify(blown_leads_cache)
 
 # =========================================================
-# CSV EXPORT
+# CSV
 # =========================================================
 @app.route("/export")
 def export():
     si = StringIO()
     writer = csv.writer(si)
-    writer.writerow(["Name","Team","League","Division","Season","L5","L10","AB"])
+    writer.writerow(["Name","Team","Season","L5","L10","AB"])
     for p in cached_players:
-        writer.writerow([p["name"],p["team"],p["league"],p["division"],p["season_avg"],p["l5_avg"],p["l10_avg"],p["ab"]])
+        writer.writerow([p["name"],p["team"],p["season_avg"],p["l5_avg"],p["l10_avg"],p["ab"]])
     return send_file(StringIO(si.getvalue()), mimetype="text/csv", as_attachment=True, download_name="mlb.csv")
 
 # =========================================================
-# UI (FULL)
+# UI
 # =========================================================
-HTML = """
+HOME_HTML = """
 <html>
 <head>
 <style>
@@ -198,19 +191,20 @@ a { color:#66ccff; }
 
 <body>
 
-<h2>MLB Batting Dashboard v2.2</h2>
+<h2>MLB Batting Dashboard v2.3</h2>
 
 <a href="/blown">Blown Leads</a><br>
 
-<button onclick="exportCSV()">Export CSV</button><br>
+<button onclick="exportCSV()">Export CSV</button>
+<button onclick="clearSelections()">CLEAR SELECTIONS</button><br>
 
 <select id="team"></select>
 <select id="league"></select>
 <select id="division"></select>
 
 <input id="search" placeholder="Search players..." oninput="load()">
-
 <input id="addPlayer" placeholder="Add player (max 10)" oninput="suggest()">
+
 <div id="suggestions"></div>
 
 <table>
@@ -228,8 +222,7 @@ a { color:#66ccff; }
 </table>
 
 <script>
-let data=[],field="season_avg",dir="desc";
-let selected=[];
+let data=[],field="season_avg",dir="desc",selected=[];
 
 function sort(f){
     if(field===f) dir=dir==="asc"?"desc":"asc";
@@ -238,6 +231,11 @@ function sort(f){
 }
 
 function exportCSV(){ window.location="/export"; }
+
+function clearSelections(){
+    selected=[];
+    load();
+}
 
 function color(v,min,max){
     let r=(v-min)/(max-min+0.0001);
@@ -300,16 +298,72 @@ function load(){
     let l5=rows.map(p=>p.l5_avg);
     let l10=rows.map(p=>p.l10_avg);
 
-    let body=rows.map(p=>`<tr>
-    <td>${p.name}</td>
-    <td>${p.team}</td>
-    <td>${p.season_avg}</td>
-    <td style="background:${color(p.l5_avg,Math.min(...l5),Math.max(...l5))}">${p.l5_avg}</td>
-    <td style="background:${color(p.l10_avg,Math.min(...l10),Math.max(...l10))}">${p.l10_avg}</td>
-    <td>${p.ab}</td>
-    </tr>`).join("");
+    document.getElementById("body").innerHTML=
+        rows.map(p=>`<tr>
+        <td>${p.name}</td>
+        <td>${p.team}</td>
+        <td>${p.season_avg}</td>
+        <td style="background:${color(p.l5_avg,Math.min(...l5),Math.max(...l5))}">${p.l5_avg}</td>
+        <td style="background:${color(p.l10_avg,Math.min(...l10),Math.max(...l10))}">${p.l10_avg}</td>
+        <td>${p.ab}</td>
+        </tr>`).join("");
+}
 
-    document.getElementById("body").innerHTML=body;
+init();
+</script>
+
+</body>
+</html>
+"""
+
+BLOWN_HTML = """
+<html>
+<head>
+<style>
+body { background:#181a1b; color:white; font-family:Arial; }
+table { border-collapse:collapse; width:50%; }
+th,td { border:1px solid #333; padding:6px; }
+th { cursor:pointer; background:#222; }
+a { color:#66ccff; }
+</style>
+</head>
+
+<body>
+
+<h2>MLB Blown Leads v2.3</h2>
+
+<a href="/">Back</a>
+
+<table>
+<thead>
+<tr>
+<th onclick="sort('team')">Team</th>
+<th onclick="sort('value')">Blown Leads</th>
+</tr>
+</thead>
+<tbody id="body"></tbody>
+</table>
+
+<script>
+let data=[],field="value",dir="desc";
+
+function sort(f){
+    if(field===f) dir=dir==="asc"?"desc":"asc";
+    else {field=f;dir="desc";}
+    render();
+}
+
+async function init(){
+    let res=await fetch("/api/blown");
+    let raw=await res.json();
+    data=Object.entries(raw).map(([k,v])=>({team:k,value:v}));
+    render();
+}
+
+function render(){
+    data.sort((a,b)=>dir==="asc"?a[field]-b[field]:b[field]-a[field]);
+    document.getElementById("body").innerHTML=
+        data.map(r=>`<tr><td>${r.team}</td><td>${r.value}</td></tr>`).join("");
 }
 
 init();
@@ -321,11 +375,11 @@ init();
 
 @app.route("/")
 def home():
-    return render_template_string(HTML)
+    return render_template_string(HOME_HTML)
 
 @app.route("/blown")
 def blown():
-    return jsonify(blown_leads_cache)
+    return render_template_string(BLOWN_HTML)
 
 # =========================================================
 # STARTUP
