@@ -15,10 +15,14 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
+MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
+MLB_BOXSCORE_URL = "https://statsapi.mlb.com/api/v1.1/game/{gamePk}/feed/live"
+
 CACHE_FILE = "cache.json"
 
 cached_players = []
 blown_leads_cache = {}
+teams_info = {}
 started = False
 
 # =========================================================
@@ -28,17 +32,19 @@ def save_cache():
     with open(CACHE_FILE, "w") as f:
         json.dump({
             "players": cached_players,
-            "blown": blown_leads_cache
+            "blown": blown_leads_cache,
+            "teams": teams_info
         }, f)
 
 def load_cache():
-    global cached_players, blown_leads_cache
+    global cached_players, blown_leads_cache, teams_info
     if os.path.exists(CACHE_FILE):
         with open(CACHE_FILE) as f:
             data = json.load(f)
             cached_players = data.get("players", [])
             blown_leads_cache = data.get("blown", {})
-            logging.info("Loaded cache")
+            teams_info = data.get("teams", {})
+            logging.info("Cache loaded")
 
 # =========================================================
 # HELPERS
@@ -53,9 +59,9 @@ def compute_avg(games, n):
     return round(hits / ab, 3) if ab > 0 else 0.0
 
 # =========================================================
-# PLAYER LOAD
+# LOAD PLAYERS + TEAM INFO
 # =========================================================
-async def fetch_player(session, player, team_abbr):
+async def fetch_player(session, player, team):
     try:
         pid = player["person"]["id"]
         name = player["person"]["fullName"]
@@ -68,7 +74,9 @@ async def fetch_player(session, player, team_abbr):
 
         return {
             "name": name,
-            "team": team_abbr,
+            "team": team["abbreviation"],
+            "league": team["league"]["name"],
+            "division": team["division"]["name"],
             "season_avg": float(stat.get("avg", 0)),
             "l5_avg": compute_avg(games, 5),
             "l10_avg": compute_avg(games, 10),
@@ -78,31 +86,69 @@ async def fetch_player(session, player, team_abbr):
         return None
 
 async def load_players():
-    global cached_players
+    global cached_players, teams_info
+
     async with aiohttp.ClientSession() as session:
         teams = (await fetch_json(session, f"{MLB_API_BASE}/teams?sportId=1"))["teams"]
 
         players = []
         for t in teams:
+            teams_info[t["abbreviation"]] = {
+                "league": t["league"]["name"],
+                "division": t["division"]["name"]
+            }
+
             roster = (await fetch_json(session, f"{MLB_API_BASE}/teams/{t['id']}/roster"))["roster"]
 
             batters = [p for p in roster if p["position"]["abbreviation"] in
                        ("1B","2B","3B","SS","LF","CF","RF","C","DH")]
 
-            tasks = [fetch_player(session, p, t["abbreviation"]) for p in batters]
+            tasks = [fetch_player(session, p, t) for p in batters]
             results = await asyncio.gather(*tasks)
 
             players.extend([r for r in results if r])
 
         cached_players = players
         save_cache()
-        logging.info("Players refreshed")
+        logging.info("Players loaded")
 
 # =========================================================
-# BLOWN LEADS (kept simple but working)
+# BLOWN LEADS
 # =========================================================
+def get_games():
+    r = requests.get(MLB_SCHEDULE_URL, params={"sportId":1,"season":2026})
+    games=[]
+    for d in r.json().get("dates",[]):
+        for g in d["games"]:
+            if g["status"]["detailedState"]=="Final":
+                games.append(g)
+    return games
+
+def get_linescore(pk):
+    return requests.get(MLB_BOXSCORE_URL.format(gamePk=pk)).json()["liveData"]["linescore"]["innings"]
+
 def compute_blown():
-    return blown_leads_cache
+    blown=defaultdict(int)
+    for g in get_games():
+        try:
+            innings=get_linescore(g["gamePk"])
+            home=g["teams"]["home"]["team"]["name"]
+            away=g["teams"]["away"]["team"]["name"]
+
+            h=a=0
+            h_lead=a_lead=False
+
+            for i in innings:
+                h+=i.get("home",{}).get("runs",0)
+                a+=i.get("away",{}).get("runs",0)
+                if h>a: h_lead=True
+                if a>h: a_lead=True
+
+            if h_lead and h<a: blown[home]+=1
+            if a_lead and a<h: blown[away]+=1
+        except:
+            pass
+    return dict(sorted(blown.items(), key=lambda x:x[1], reverse=True))
 
 def blown_loop():
     global blown_leads_cache
@@ -129,18 +175,15 @@ def api_blown():
 def export():
     si = StringIO()
     writer = csv.writer(si)
-    writer.writerow(["Name","Team","Season","L5","L10","AB"])
-
+    writer.writerow(["Name","Team","League","Division","Season","L5","L10","AB"])
     for p in cached_players:
-        writer.writerow([p["name"], p["team"], p["season_avg"], p["l5_avg"], p["l10_avg"], p["ab"]])
-
-    output = StringIO(si.getvalue())
-    return send_file(output, mimetype="text/csv", as_attachment=True, download_name="mlb_stats.csv")
+        writer.writerow([p["name"],p["team"],p["league"],p["division"],p["season_avg"],p["l5_avg"],p["l10_avg"],p["ab"]])
+    return send_file(StringIO(si.getvalue()), mimetype="text/csv", as_attachment=True, download_name="mlb.csv")
 
 # =========================================================
-# UI
+# UI (FULL)
 # =========================================================
-HOME_HTML = """
+HTML = """
 <html>
 <head>
 <style>
@@ -148,26 +191,27 @@ body { background:#181a1b; color:white; font-family:Arial; }
 table { border-collapse:collapse; width:100%; }
 th,td { border:1px solid #333; padding:6px; }
 th { cursor:pointer; background:#222; }
-select,input,button { margin:5px; padding:5px; }
+input,select,button { margin:5px; padding:5px; }
 a { color:#66ccff; }
 </style>
 </head>
 
 <body>
 
-<h2>MLB Batting Dashboard v2.1</h2>
+<h2>MLB Batting Dashboard v2.2</h2>
 
-<a href="/blown">Blown Leads</a>
+<a href="/blown">Blown Leads</a><br>
 
-<br><br>
-
-<button onclick="exportCSV()">Export CSV</button>
-
-<br>
+<button onclick="exportCSV()">Export CSV</button><br>
 
 <select id="team"></select>
+<select id="league"></select>
+<select id="division"></select>
 
 <input id="search" placeholder="Search players..." oninput="load()">
+
+<input id="addPlayer" placeholder="Add player (max 10)" oninput="suggest()">
+<div id="suggestions"></div>
 
 <table>
 <thead>
@@ -184,8 +228,8 @@ a { color:#66ccff; }
 </table>
 
 <script>
-let data=[];
-let field="season_avg",dir="desc";
+let data=[],field="season_avg",dir="desc";
+let selected=[];
 
 function sort(f){
     if(field===f) dir=dir==="asc"?"desc":"asc";
@@ -193,44 +237,59 @@ function sort(f){
     load();
 }
 
-function exportCSV(){
-    window.location="/export";
-}
+function exportCSV(){ window.location="/export"; }
 
-function color(val,min,max){
-    let ratio=(val-min)/(max-min+0.0001);
-    let r=Math.floor(255*ratio);
-    let b=Math.floor(255*(1-ratio));
-    return `rgb(${r},0,${b})`;
+function color(v,min,max){
+    let r=(v-min)/(max-min+0.0001);
+    return `rgb(${Math.floor(255*r)},0,${Math.floor(255*(1-r))})`;
 }
 
 async function init(){
     let res=await fetch("/api/players");
     data=await res.json();
 
-    let teams=[...new Set(data.map(p=>p.team))].sort();
-    let sel=document.getElementById("team");
-    sel.innerHTML="<option value=''>All Teams</option>"+teams.map(t=>`<option>${t}</option>`).join("");
+    let teams=[...new Set(data.map(p=>p.team))];
+    let leagues=[...new Set(data.map(p=>p.league))];
+    let divisions=[...new Set(data.map(p=>p.division))];
 
+    team.innerHTML="<option value=''>All Teams</option>"+teams.map(t=>`<option>${t}</option>`);
+    league.innerHTML="<option value=''>All Leagues</option>"+leagues.map(l=>`<option>${l}</option>`);
+    division.innerHTML="<option value=''>All Divisions</option>"+divisions.map(d=>`<option>${d}</option>`);
+
+    load();
+}
+
+function suggest(){
+    let q=addPlayer.value.toLowerCase();
+    if(!q){ suggestions.innerHTML=""; return; }
+
+    let matches=data.filter(p=>p.name.toLowerCase().includes(q)).slice(0,10);
+
+    suggestions.innerHTML=matches.map(p=>
+        `<div onclick="add('${p.name}')">${p.name}</div>`
+    ).join("");
+}
+
+function add(name){
+    if(selected.length>=10) return;
+    if(!selected.includes(name)) selected.push(name);
+    suggestions.innerHTML="";
+    addPlayer.value="";
     load();
 }
 
 function load(){
     let rows=[...data];
 
-    let search=document.getElementById("search").value.toLowerCase();
-    let team=document.getElementById("team").value;
+    let s=search.value.toLowerCase();
 
     rows=rows.filter(p=>
-        (!team||p.team===team) &&
-        (p.name.toLowerCase().includes(search)||p.team.toLowerCase().includes(search))
+        (!team.value||p.team===team.value) &&
+        (!league.value||p.league===league.value) &&
+        (!division.value||p.division===division.value) &&
+        (p.name.toLowerCase().includes(s)||p.team.toLowerCase().includes(s)) &&
+        (selected.length===0 || selected.includes(p.name))
     );
-
-    if(rows.length===0){
-        document.getElementById("body").innerHTML="<tr><td colspan='6'>Loading...</td></tr>";
-        setTimeout(load,2000);
-        return;
-    }
 
     rows.sort((a,b)=>{
         let v1=a[field],v2=b[field];
@@ -241,77 +300,16 @@ function load(){
     let l5=rows.map(p=>p.l5_avg);
     let l10=rows.map(p=>p.l10_avg);
 
-    let l5min=Math.min(...l5), l5max=Math.max(...l5);
-    let l10min=Math.min(...l10), l10max=Math.max(...l10);
+    let body=rows.map(p=>`<tr>
+    <td>${p.name}</td>
+    <td>${p.team}</td>
+    <td>${p.season_avg}</td>
+    <td style="background:${color(p.l5_avg,Math.min(...l5),Math.max(...l5))}">${p.l5_avg}</td>
+    <td style="background:${color(p.l10_avg,Math.min(...l10),Math.max(...l10))}">${p.l10_avg}</td>
+    <td>${p.ab}</td>
+    </tr>`).join("");
 
-    document.getElementById("body").innerHTML=
-        rows.map(p=>`<tr>
-        <td>${p.name}</td>
-        <td>${p.team}</td>
-        <td>${p.season_avg}</td>
-        <td style="background:${color(p.l5_avg,l5min,l5max)}">${p.l5_avg}</td>
-        <td style="background:${color(p.l10_avg,l10min,l10max)}">${p.l10_avg}</td>
-        <td>${p.ab}</td>
-        </tr>`).join("");
-}
-
-init();
-</script>
-
-</body>
-</html>
-"""
-
-BLOWN_HTML = """
-<html>
-<head>
-<style>
-body { background:#181a1b; color:white; font-family:Arial; }
-table { border-collapse:collapse; width:50%; }
-th,td { border:1px solid #333; padding:6px; }
-th { cursor:pointer; background:#222; }
-a { color:#66ccff; }
-</style>
-</head>
-
-<body>
-
-<h2>MLB Blown Leads v2.1</h2>
-
-<a href="/">Back</a>
-
-<table>
-<thead>
-<tr>
-<th onclick="sort('team')">Team</th>
-<th onclick="sort('value')">Blown Leads</th>
-</tr>
-</thead>
-<tbody id="body"></tbody>
-</table>
-
-<script>
-let data=[],field="value",dir="desc";
-
-function sort(f){
-    if(field===f) dir=dir==="asc"?"desc":"asc";
-    else {field=f;dir="desc";}
-    render();
-}
-
-async function init(){
-    let res=await fetch("/api/blown");
-    let raw=await res.json();
-
-    data=Object.entries(raw).map(([k,v])=>({team:k,value:v}));
-    render();
-}
-
-function render(){
-    data.sort((a,b)=>dir==="asc"?a[field]-b[field]:b[field]-a[field]);
-
-    document.getElementById("body").innerHTML=
-        data.map((r,i)=>`<tr><td>${r.team}</td><td>${r.value}</td></tr>`).join("");
+    document.getElementById("body").innerHTML=body;
 }
 
 init();
@@ -323,11 +321,11 @@ init();
 
 @app.route("/")
 def home():
-    return render_template_string(HOME_HTML)
+    return render_template_string(HTML)
 
 @app.route("/blown")
 def blown():
-    return render_template_string(BLOWN_HTML)
+    return jsonify(blown_leads_cache)
 
 # =========================================================
 # STARTUP
