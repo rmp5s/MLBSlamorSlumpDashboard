@@ -1,18 +1,23 @@
 import asyncio
 import logging
+import os
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
-from flask import Flask, render_template, jsonify, request
+
 import aiohttp
+from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 
 logging.basicConfig(
-    filename="dashboard.log",
     level=logging.INFO,
-    format="[%(asctime)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("dashboard.log")
+    ],
 )
 
 MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
@@ -29,26 +34,26 @@ def format_avg(avg):
     return ".%03d" % int(round(avg * 1000))
 
 
-def calc_avg(hits, ab):
-    return hits / ab if ab > 0 else None
+def calc_avg(hits, at_bats):
+    return hits / at_bats if at_bats > 0 else None
 
 
 async def fetch_json(session, url, params=None):
     try:
         async with session.get(url, params=params, timeout=30) as resp:
             if resp.status != 200:
-                logging.warning(f"HTTP {resp.status} for {url}")
+                logging.warning("HTTP %s for %s", resp.status, url)
                 return {}
             return await resp.json()
     except Exception as e:
-        logging.warning(f"Fetch error for {url}: {e}")
+        logging.warning("Fetch error for %s: %s", url, e)
         return {}
 
 
 def avg_from_games(games):
     hits = sum(int(g.get("hits", 0)) for g in games)
-    ab = sum(int(g.get("atBats", 0)) for g in games)
-    return calc_avg(hits, ab)
+    at_bats = sum(int(g.get("atBats", 0)) for g in games)
+    return calc_avg(hits, at_bats)
 
 
 async def fetch_season_stat(session, player_id, season_year):
@@ -56,12 +61,11 @@ async def fetch_season_stat(session, player_id, season_year):
     params = {
         "stats": "season",
         "group": "hitting",
-        "season": str(season_year)
+        "season": str(season_year),
     }
 
     data = await fetch_json(session, url, params)
     stats_list = data.get("stats", [])
-
     if not stats_list:
         return None
 
@@ -81,7 +85,7 @@ async def get_recent_team_games(session, team_id):
         "sportId": 1,
         "teamId": team_id,
         "startDate": start.strftime("%Y-%m-%d"),
-        "endDate": end.strftime("%Y-%m-%d")
+        "endDate": end.strftime("%Y-%m-%d"),
     }
 
     data = await fetch_json(session, url, params)
@@ -93,7 +97,7 @@ async def get_recent_team_games(session, team_id):
             if status in ("Final", "Game Over", "Completed Early"):
                 games.append({
                     "gamePk": game["gamePk"],
-                    "gameDate": game.get("gameDate", "")
+                    "gameDate": game.get("gameDate", ""),
                 })
 
     games.sort(key=lambda g: g["gameDate"], reverse=True)
@@ -109,14 +113,10 @@ def get_player_batting_from_boxscore(boxscore, player_id):
     teams = boxscore.get("teams", {})
     all_players = {}
 
-    home_players = teams.get("home", {}).get("players", {})
-    away_players = teams.get("away", {}).get("players", {})
+    all_players.update(teams.get("home", {}).get("players", {}))
+    all_players.update(teams.get("away", {}).get("players", {}))
 
-    all_players.update(home_players)
-    all_players.update(away_players)
-
-    player_key = f"ID{player_id}"
-    player_data = all_players.get(player_key, {})
+    player_data = all_players.get(f"ID{player_id}", {})
     batting = player_data.get("stats", {}).get("batting")
 
     if not batting:
@@ -124,7 +124,7 @@ def get_player_batting_from_boxscore(boxscore, player_id):
 
     return {
         "hits": int(batting.get("hits", 0)),
-        "atBats": int(batting.get("atBats", 0))
+        "atBats": int(batting.get("atBats", 0)),
     }
 
 
@@ -133,7 +133,7 @@ async def process_team(session, team, season_year):
     team_abbr = team["abbreviation"]
     team_name = team.get("name", team_abbr)
 
-    logging.info(f"Loading team: {team_name}")
+    logging.info("Loading team: %s", team_name)
 
     roster_url = f"{MLB_API_BASE}/teams/{team_id}/roster"
     roster_data = await fetch_json(session, roster_url)
@@ -201,10 +201,10 @@ async def process_team(session, team, season_year):
             "l10": format_avg(l10_avg),
             "season": format_avg(season_avg),
             "diff_l5": (l5_avg or 0) - (season_avg or 0),
-            "diff_l10": (l10_avg or 0) - (season_avg or 0)
+            "diff_l10": (l10_avg or 0) - (season_avg or 0),
         })
 
-    logging.info(f"{team_abbr}: loaded {len(team_players)} players")
+    logging.info("%s: loaded %s players", team_abbr, len(team_players))
     return team_players
 
 
@@ -232,56 +232,80 @@ async def load_all_players():
         global cached_players
         cached_players = players
 
-    logging.info(f"Refresh complete. Loaded {len(players)} players.")
+    logging.info("Refresh complete. Loaded %s players.", len(players))
 
 
 def background_refresh_loop():
-    asyncio.run(load_all_players())
-
     while True:
-        time.sleep(REFRESH_SECONDS)
         try:
             asyncio.run(load_all_players())
-        except Exception as e:
-            logging.exception(f"Background refresh failed: {e}")
+        except Exception:
+            logging.exception("Background refresh failed")
+
+        time.sleep(REFRESH_SECONDS)
 
 
 @app.route("/")
 def index():
-    with cache_lock:
-        teams = sorted(set(p["team"] for p in cached_players))
-
-    return render_template("dashboard_shell.html", team_names=teams)
+    try:
+        with cache_lock:
+            teams = sorted(set(p["team"] for p in cached_players))
+        return render_template("dashboard_shell.html", team_names=teams)
+    except Exception:
+        logging.exception("Index route failed")
+        raise
 
 
 @app.route("/api/player_stats")
 def api_player_stats():
-    team = request.args.get("team", "").strip()
-    search = request.args.get("search", "").lower()
-    sort = request.args.get("sort", "name")
-    dir_ = request.args.get("dir", "asc")
+    try:
+        team = request.args.get("team", "").strip()
+        search = request.args.get("search", "").lower()
+        sort = request.args.get("sort", "name")
+        dir_ = request.args.get("dir", "asc")
 
+        with cache_lock:
+            players = list(cached_players)
+
+        if team:
+            players = [p for p in players if p["team"] == team]
+
+        if search:
+            players = [p for p in players if search in p["name"].lower()]
+
+        def sort_key(p):
+            return {
+                "name": p["name"].lower(),
+                "team": p["team"],
+                "l5": p["l5_avg"] or 0,
+                "l10": p["l10_avg"] or 0,
+                "season": p["season_avg"] or 0,
+                "ab": p["ab"],
+            }.get(sort, p["name"].lower())
+
+        players.sort(key=sort_key, reverse=(dir_ == "desc"))
+        return jsonify(players)
+    except Exception:
+        logging.exception("API route failed")
+        raise
+
+
+@app.route("/api/players")
+def api_players_alias():
+    return api_player_stats()
+
+
+@app.route("/healthz")
+def healthz():
     with cache_lock:
-        players = list(cached_players)
-
-    if team:
-        players = [p for p in players if p["team"] == team]
-
-    if search:
-        players = [p for p in players if search in p["name"].lower()]
-
-    def sort_key(p):
-        return {
-            "name": p["name"].lower(),
-            "team": p["team"],
-            "l5": p["l5_avg"] or 0,
-            "l10": p["l10_avg"] or 0,
-            "season": p["season_avg"] or 0,
-            "ab": p["ab"]
-        }.get(sort, p["name"].lower())
-
-    players.sort(key=sort_key, reverse=(dir_ == "desc"))
-    return jsonify(players)
+        count = len(cached_players)
+    return jsonify({"ok": True, "players_loaded": count})
 
 
-threading.Thread(target=background_refresh_loop, daemon=True).start()
+if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+    threading.Thread(target=background_refresh_loop, daemon=True).start()
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
