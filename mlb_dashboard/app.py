@@ -14,7 +14,7 @@ app = Flask(__name__)
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 
 MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
@@ -23,7 +23,13 @@ LOOKBACK_DAYS = 90
 
 cached_players = []
 cache_loaded = False
+cache_loading = False
+last_updated = None
+last_load_error = None
+
 cache_lock = threading.Lock()
+loader_lock = threading.Lock()
+loader_started = False
 
 
 def format_avg(avg):
@@ -56,9 +62,13 @@ def avg_from_games(games):
 
 async def fetch_season_stat(session, player_id, season_year):
     url = f"{MLB_API_BASE}/people/{player_id}/stats"
-    params = {"stats": "season", "group": "hitting", "season": str(season_year)}
-    data = await fetch_json(session, url, params)
+    params = {
+        "stats": "season",
+        "group": "hitting",
+        "season": str(season_year),
+    }
 
+    data = await fetch_json(session, url, params)
     stats_list = data.get("stats", [])
     if not stats_list:
         return None
@@ -91,7 +101,7 @@ async def get_recent_team_games(session, team_id):
             if status in ("Final", "Game Over", "Completed Early"):
                 games.append({
                     "gamePk": game["gamePk"],
-                    "gameDate": game.get("gameDate", "")
+                    "gameDate": game.get("gameDate", ""),
                 })
 
     games.sort(key=lambda g: g["gameDate"], reverse=True)
@@ -99,22 +109,26 @@ async def get_recent_team_games(session, team_id):
 
 
 async def fetch_boxscore(session, game_pk):
-    return await fetch_json(session, f"{MLB_API_BASE}/game/{game_pk}/boxscore")
+    url = f"{MLB_API_BASE}/game/{game_pk}/boxscore"
+    return await fetch_json(session, url)
 
 
 def get_player_batting_from_boxscore(boxscore, player_id):
     teams = boxscore.get("teams", {})
     all_players = {}
+
     all_players.update(teams.get("home", {}).get("players", {}))
     all_players.update(teams.get("away", {}).get("players", {}))
 
-    batting = all_players.get(f"ID{player_id}", {}).get("stats", {}).get("batting")
+    player_data = all_players.get(f"ID{player_id}", {})
+    batting = player_data.get("stats", {}).get("batting")
+
     if not batting:
         return None
 
     return {
         "hits": int(batting.get("hits", 0)),
-        "atBats": int(batting.get("atBats", 0))
+        "atBats": int(batting.get("atBats", 0)),
     }
 
 
@@ -124,7 +138,8 @@ async def process_team(session, team, season_year):
 
     logging.info("Loading team: %s", team_abbr)
 
-    roster_data = await fetch_json(session, f"{MLB_API_BASE}/teams/{team_id}/roster")
+    roster_url = f"{MLB_API_BASE}/teams/{team_id}/roster"
+    roster_data = await fetch_json(session, roster_url)
     roster = roster_data.get("roster", [])
 
     batters = [
@@ -133,12 +148,16 @@ async def process_team(session, team, season_year):
     ]
 
     recent_games = await get_recent_team_games(session, team_id)
+
     boxscores = await asyncio.gather(
         *[fetch_boxscore(session, g["gamePk"]) for g in recent_games]
     )
 
     season_stats = await asyncio.gather(
-        *[fetch_season_stat(session, p["person"]["id"], season_year) for p in batters]
+        *[
+            fetch_season_stat(session, p["person"]["id"], season_year)
+            for p in batters
+        ]
     )
 
     team_players = []
@@ -189,49 +208,83 @@ async def process_team(session, team, season_year):
 
 
 async def load_all_players():
-    global cached_players, cache_loaded
-
-    logging.info("Starting MLB data refresh...")
-    season_year = datetime.utcnow().year
-
-    async with aiohttp.ClientSession() as session:
-        teams_data = await fetch_json(session, f"{MLB_API_BASE}/teams?sportId=1")
-        teams = teams_data.get("teams", [])
-
-        results = await asyncio.gather(
-            *[process_team(session, team, season_year) for team in teams]
-        )
-
-    players = []
-    for team_players in results:
-        players.extend(team_players)
-
-    players.sort(key=lambda p: (p["team"], p["name"]))
+    global cached_players, cache_loaded, cache_loading, last_updated, last_load_error
 
     with cache_lock:
-        cached_players = players
-        cache_loaded = True
+        if cache_loading:
+            logging.info("Load already in progress; skipping duplicate load.")
+            return
+        cache_loading = True
 
-    logging.info("Refresh complete. Loaded %s players.", len(players))
+    try:
+        logging.info("Starting MLB data refresh...")
+        season_year = datetime.utcnow().year
+
+        async with aiohttp.ClientSession() as session:
+            teams_url = f"{MLB_API_BASE}/teams?sportId=1"
+            teams_data = await fetch_json(session, teams_url)
+            teams = teams_data.get("teams", [])
+
+            if not teams:
+                raise RuntimeError("No teams returned from MLB API")
+
+            all_team_results = await asyncio.gather(
+                *[process_team(session, team, season_year) for team in teams]
+            )
+
+        players = []
+        for team_players in all_team_results:
+            players.extend(team_players)
+
+        players.sort(key=lambda p: (p["team"], p["name"]))
+
+        with cache_lock:
+            cached_players = players
+            cache_loaded = True
+            cache_loading = False
+            last_updated = datetime.utcnow().isoformat() + "Z"
+            last_load_error = None
+
+        logging.info("Refresh complete. Loaded %s players.", len(players))
+
+    except Exception as e:
+        with cache_lock:
+            cache_loading = False
+            last_load_error = str(e)
+        logging.exception("MLB data refresh failed")
 
 
 def background_refresh_loop():
     while True:
         try:
             asyncio.run(load_all_players())
-        except Exception:
-            logging.exception("Background refresh failed")
+        except Exception as e:
+            logging.exception("Background refresh failed: %s", e)
+
         time.sleep(REFRESH_SECONDS)
+
+
+def ensure_loader_started():
+    global loader_started
+
+    with loader_lock:
+        if not loader_started:
+            loader_started = True
+            logging.info("Starting background loader thread...")
+            threading.Thread(target=background_refresh_loop, daemon=True).start()
 
 
 @app.route("/")
 def index():
+    ensure_loader_started()
     return HTML_PAGE
 
 
 @app.route("/api/players")
 @app.route("/api/player_stats")
 def api_players():
+    ensure_loader_started()
+
     team = request.args.get("team", "").strip()
     search = request.args.get("search", "").lower()
     selected = request.args.get("selected", "").strip()
@@ -241,6 +294,9 @@ def api_players():
     with cache_lock:
         players = list(cached_players)
         loaded = cache_loaded
+        loading = cache_loading
+        error = last_load_error
+        updated = last_updated
 
     if team:
         players = [p for p in players if p["team"] == team]
@@ -249,7 +305,11 @@ def api_players():
         players = [p for p in players if search in p["name"].lower()]
 
     if selected:
-        selected_names = {name.strip() for name in selected.split("|") if name.strip()}
+        selected_names = {
+            name.strip()
+            for name in selected.split("|")
+            if name.strip()
+        }
         players = [p for p in players if p["name"] in selected_names]
 
     def sort_key(p):
@@ -264,19 +324,42 @@ def api_players():
 
     players.sort(key=sort_key, reverse=(dir_ == "desc"))
 
+    with cache_lock:
+        teams = sorted(set(p["team"] for p in cached_players))
+        all_players = sorted(p["name"] for p in cached_players)
+
     return jsonify({
         "loaded": loaded,
+        "loading": loading,
+        "last_load_error": error,
+        "last_updated": updated,
         "count": len(players),
         "players": players,
-        "teams": sorted(set(p["team"] for p in cached_players)),
-        "all_players": sorted([p["name"] for p in cached_players])
+        "teams": teams,
+        "all_players": all_players,
     })
 
 
 @app.route("/healthz")
 def healthz():
+    ensure_loader_started()
+
     with cache_lock:
-        return jsonify({"ok": True, "loaded": cache_loaded, "players_loaded": len(cached_players)})
+        count = len(cached_players)
+        loaded = cache_loaded
+        loading = cache_loading
+        error = last_load_error
+        updated = last_updated
+
+    return jsonify({
+        "ok": True,
+        "loaded": loaded,
+        "loading": loading,
+        "players_loaded": count,
+        "loader_started": loader_started,
+        "last_updated": updated,
+        "last_load_error": error,
+    })
 
 
 HTML_PAGE = """
@@ -296,6 +379,7 @@ th { background:#2f6fa3; color:white; cursor:pointer; position:sticky; top:0; }
 tr:nth-child(even){ background:#2a2a2a; }
 tr:nth-child(odd){ background:#202020; }
 .muted { color:#bbb; font-size:.9em; }
+.error { color:#ffb3b3; font-size:.9em; }
 #playerPicker { min-width:260px; height:120px; }
 </style>
 </head>
@@ -319,6 +403,8 @@ tr:nth-child(odd){ background:#202020; }
 <button id="applyBtn" type="button">Apply</button>
 <span class="muted" id="statusText">Loading...</span>
 </div>
+
+<div class="error" id="errorText"></div>
 
 <table>
 <thead>
@@ -355,7 +441,7 @@ function populateFilters(data) {
     const teamSelect = document.getElementById("team");
     const currentTeam = teamSelect.value;
 
-    if (teamSelect.options.length <= 1) {
+    if (teamSelect.options.length <= 1 && data.teams.length) {
         data.teams.forEach(team => {
             const opt = document.createElement("option");
             opt.value = team;
@@ -378,7 +464,10 @@ function populateFilters(data) {
 
 function loadPlayers() {
     const statusText = document.getElementById("statusText");
+    const errorText = document.getElementById("errorText");
+
     statusText.textContent = "Loading...";
+    errorText.textContent = "";
 
     const params = new URLSearchParams({
         team: document.getElementById("team").value,
@@ -393,8 +482,14 @@ function loadPlayers() {
         .then(data => {
             populateFilters(data);
 
+            if (data.last_load_error) {
+                errorText.textContent = `Loader error: ${data.last_load_error}`;
+            }
+
             if (!data.loaded) {
-                statusText.textContent = "Data still loading... retrying.";
+                statusText.textContent = data.loading
+                    ? "Data still loading... retrying."
+                    : "Data not loaded yet... retrying.";
                 setTimeout(loadPlayers, 3000);
                 return;
             }
@@ -415,7 +510,8 @@ function loadPlayers() {
                 tbody.appendChild(row);
             });
 
-            statusText.textContent = `${data.count} players shown`;
+            statusText.textContent = `${data.count} players shown` +
+                (data.last_updated ? ` | Updated ${data.last_updated}` : "");
         })
         .catch(err => {
             console.error(err);
@@ -424,18 +520,25 @@ function loadPlayers() {
 }
 
 document.getElementById("applyBtn").addEventListener("click", loadPlayers);
+
 document.getElementById("clearPlayers").addEventListener("click", () => {
     Array.from(document.getElementById("playerPicker").options).forEach(o => o.selected = false);
     loadPlayers();
 });
+
 document.getElementById("search").addEventListener("keydown", e => {
     if (e.key === "Enter") loadPlayers();
 });
+
 document.querySelectorAll("th[data-sort]").forEach(th => {
     th.addEventListener("click", () => {
         const sort = th.dataset.sort;
-        if (currentSort === sort) currentDir = currentDir === "asc" ? "desc" : "asc";
-        else { currentSort = sort; currentDir = "asc"; }
+        if (currentSort === sort) {
+            currentDir = currentDir === "asc" ? "desc" : "asc";
+        } else {
+            currentSort = sort;
+            currentDir = "asc";
+        }
         loadPlayers();
     });
 });
@@ -446,7 +549,9 @@ loadPlayers();
 </html>
 """
 
-threading.Thread(target=background_refresh_loop, daemon=True).start()
+
+ensure_loader_started()
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
