@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import socket
 import sys
 import threading
 import time
@@ -20,7 +21,7 @@ logging.basicConfig(
 MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
 REFRESH_SECONDS = 6 * 60 * 60
 LOOKBACK_DAYS = 90
-MAX_CONCURRENT_REQUESTS = 12
+MAX_CONCURRENT_REQUESTS = 8
 
 cached_players = []
 cache_loaded = False
@@ -44,10 +45,16 @@ def calc_avg(hits, at_bats):
     return hits / at_bats if at_bats > 0 else None
 
 
+def avg_from_games(games):
+    hits = sum(int(g.get("hits", 0)) for g in games)
+    at_bats = sum(int(g.get("atBats", 0)) for g in games)
+    return calc_avg(hits, at_bats)
+
+
 async def fetch_json(session, sem, url, params=None):
     async with sem:
         try:
-            async with session.get(url, params=params, timeout=25) as resp:
+            async with session.get(url, params=params) as resp:
                 if resp.status != 200:
                     logging.warning("HTTP %s for %s", resp.status, url)
                     return {}
@@ -55,12 +62,6 @@ async def fetch_json(session, sem, url, params=None):
         except Exception as e:
             logging.warning("Fetch error for %s: %s", url, e)
             return {}
-
-
-def avg_from_games(games):
-    hits = sum(int(g.get("hits", 0)) for g in games)
-    at_bats = sum(int(g.get("atBats", 0)) for g in games)
-    return calc_avg(hits, at_bats)
 
 
 async def fetch_season_stat(session, sem, player_id, season_year):
@@ -112,8 +113,7 @@ async def get_recent_team_games(session, sem, team_id):
 
 
 async def fetch_boxscore(session, sem, game_pk):
-    url = f"{MLB_API_BASE}/game/{game_pk}/boxscore"
-    return await fetch_json(session, sem, url)
+    return await fetch_json(session, sem, f"{MLB_API_BASE}/game/{game_pk}/boxscore")
 
 
 def get_player_batting_from_boxscore(boxscore, player_id):
@@ -123,9 +123,7 @@ def get_player_batting_from_boxscore(boxscore, player_id):
     all_players.update(teams.get("home", {}).get("players", {}))
     all_players.update(teams.get("away", {}).get("players", {}))
 
-    player_data = all_players.get(f"ID{player_id}", {})
-    batting = player_data.get("stats", {}).get("batting")
-
+    batting = all_players.get(f"ID{player_id}", {}).get("stats", {}).get("batting")
     if not batting:
         return None
 
@@ -141,7 +139,9 @@ async def process_team(session, sem, team, season_year, team_index, team_total):
     team_id = team["id"]
     team_abbr = team["abbreviation"]
 
-    load_progress = f"Loading {team_abbr} ({team_index}/{team_total})"
+    with cache_lock:
+        load_progress = f"Loading {team_abbr} ({team_index}/{team_total})"
+
     logging.info(load_progress)
 
     roster_url = f"{MLB_API_BASE}/teams/{team_id}/roster"
@@ -157,8 +157,7 @@ async def process_team(session, sem, team, season_year, team_index, team_total):
 
     boxscores = []
     for game in recent_games:
-        box = await fetch_boxscore(session, sem, game["gamePk"])
-        boxscores.append(box)
+        boxscores.append(await fetch_boxscore(session, sem, game["gamePk"]))
 
     team_players = []
 
@@ -216,16 +215,23 @@ async def load_all_players():
             logging.info("Load already in progress; skipping duplicate load.")
             return
         cache_loading = True
-        load_progress = "Starting MLB data refresh..."
+        cache_loaded = False
+        last_load_error = None
+        load_progress = "Fetching MLB teams..."
 
     try:
         logging.info("Starting MLB data refresh...")
+
         season_year = datetime.utcnow().year
         sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-        timeout = aiohttp.ClientTimeout(total=180)
+        timeout = aiohttp.ClientTimeout(total=300)
+        connector = aiohttp.TCPConnector(
+            limit=MAX_CONCURRENT_REQUESTS,
+            family=socket.AF_INET
+        )
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             teams_url = f"{MLB_API_BASE}/teams?sportId=1"
             teams_data = await fetch_json(session, sem, teams_url)
             teams = teams_data.get("teams", [])
@@ -233,40 +239,41 @@ async def load_all_players():
             if not teams:
                 raise RuntimeError("No teams returned from MLB API")
 
-            all_team_results = []
+            all_players = []
 
             for idx, team in enumerate(teams, start=1):
                 team_players = await process_team(
-                    session,
-                    sem,
-                    team,
-                    season_year,
-                    idx,
-                    len(teams)
+                    session=session,
+                    sem=sem,
+                    team=team,
+                    season_year=season_year,
+                    team_index=idx,
+                    team_total=len(teams),
                 )
-                all_team_results.append(team_players)
 
-        players = []
-        for team_players in all_team_results:
-            players.extend(team_players)
+                all_players.extend(team_players)
+                all_players.sort(key=lambda p: (p["team"], p["name"]))
 
-        players.sort(key=lambda p: (p["team"], p["name"]))
+                with cache_lock:
+                    cached_players = list(all_players)
+                    load_progress = f"Loaded {len(all_players)} players so far..."
 
         with cache_lock:
-            cached_players = players
+            cached_players = all_players
             cache_loaded = True
             cache_loading = False
             last_updated = datetime.utcnow().isoformat() + "Z"
             last_load_error = None
-            load_progress = f"Loaded {len(players)} players."
+            load_progress = f"Loaded {len(all_players)} players."
 
-        logging.info("Refresh complete. Loaded %s players.", len(players))
+        logging.info("Refresh complete. Loaded %s players.", len(all_players))
 
     except Exception as e:
         with cache_lock:
             cache_loading = False
             last_load_error = str(e)
             load_progress = f"Load failed: {e}"
+
         logging.exception("MLB data refresh failed")
 
 
@@ -314,6 +321,7 @@ def api_players():
         error = last_load_error
         updated = last_updated
         progress = load_progress
+        all_cached = list(cached_players)
 
     if team:
         players = [p for p in players if p["team"] == team]
@@ -341,10 +349,6 @@ def api_players():
 
     players.sort(key=sort_key, reverse=(dir_ == "desc"))
 
-    with cache_lock:
-        teams = sorted(set(p["team"] for p in cached_players))
-        all_players = sorted(p["name"] for p in cached_players)
-
     return jsonify({
         "loaded": loaded,
         "loading": loading,
@@ -353,8 +357,8 @@ def api_players():
         "load_progress": progress,
         "count": len(players),
         "players": players,
-        "teams": teams,
-        "all_players": all_players,
+        "teams": sorted(set(p["team"] for p in all_cached)),
+        "all_players": sorted(p["name"] for p in all_cached),
     })
 
 
@@ -475,6 +479,24 @@ function populateFilters(data) {
     }
 }
 
+function renderRows(data) {
+    const tbody = document.getElementById("playerRows");
+    tbody.innerHTML = "";
+
+    data.players.forEach(player => {
+        const row = document.createElement("tr");
+        row.innerHTML = `
+            <td>${player.name}</td>
+            <td>${player.team}</td>
+            <td style="background:${shade(player.diff_l5)}; color:#111;">${player.l5}</td>
+            <td style="background:${shade(player.diff_l10)}; color:#111;">${player.l10}</td>
+            <td>${player.season}</td>
+            <td>${player.ab}</td>
+        `;
+        tbody.appendChild(row);
+    });
+}
+
 function loadPlayers() {
     const statusText = document.getElementById("statusText");
     const errorText = document.getElementById("errorText");
@@ -494,32 +516,17 @@ function loadPlayers() {
         .then(r => r.json())
         .then(data => {
             populateFilters(data);
+            renderRows(data);
 
             if (data.last_load_error) {
                 errorText.textContent = `Loader error: ${data.last_load_error}`;
             }
 
             if (!data.loaded) {
-                statusText.textContent = data.load_progress || "Data still loading... retrying.";
+                statusText.textContent = `${data.load_progress || "Data loading"} | ${data.count} shown so far`;
                 setTimeout(loadPlayers, 3000);
                 return;
             }
-
-            const tbody = document.getElementById("playerRows");
-            tbody.innerHTML = "";
-
-            data.players.forEach(player => {
-                const row = document.createElement("tr");
-                row.innerHTML = `
-                    <td>${player.name}</td>
-                    <td>${player.team}</td>
-                    <td style="background:${shade(player.diff_l5)}; color:#111;">${player.l5}</td>
-                    <td style="background:${shade(player.diff_l10)}; color:#111;">${player.l10}</td>
-                    <td>${player.season}</td>
-                    <td>${player.ab}</td>
-                `;
-                tbody.appendChild(row);
-            });
 
             statusText.textContent = `${data.count} players shown` +
                 (data.last_updated ? ` | Updated ${data.last_updated}` : "");
@@ -531,25 +538,18 @@ function loadPlayers() {
 }
 
 document.getElementById("applyBtn").addEventListener("click", loadPlayers);
-
 document.getElementById("clearPlayers").addEventListener("click", () => {
     Array.from(document.getElementById("playerPicker").options).forEach(o => o.selected = false);
     loadPlayers();
 });
-
 document.getElementById("search").addEventListener("keydown", e => {
     if (e.key === "Enter") loadPlayers();
 });
-
 document.querySelectorAll("th[data-sort]").forEach(th => {
     th.addEventListener("click", () => {
         const sort = th.dataset.sort;
-        if (currentSort === sort) {
-            currentDir = currentDir === "asc" ? "desc" : "asc";
-        } else {
-            currentSort = sort;
-            currentDir = "asc";
-        }
+        if (currentSort === sort) currentDir = currentDir === "asc" ? "desc" : "asc";
+        else { currentSort = sort; currentDir = "asc"; }
         loadPlayers();
     });
 });
@@ -561,9 +561,9 @@ loadPlayers();
 """
 
 
-ensure_loader_started()
-
-
 if __name__ == "__main__":
+    ensure_loader_started()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+else:
+    ensure_loader_started()
