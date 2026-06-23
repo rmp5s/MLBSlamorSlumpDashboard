@@ -20,12 +20,14 @@ logging.basicConfig(
 MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
 REFRESH_SECONDS = 6 * 60 * 60
 LOOKBACK_DAYS = 90
+MAX_CONCURRENT_REQUESTS = 12
 
 cached_players = []
 cache_loaded = False
 cache_loading = False
 last_updated = None
 last_load_error = None
+load_progress = "Not started"
 
 cache_lock = threading.Lock()
 loader_lock = threading.Lock()
@@ -42,16 +44,17 @@ def calc_avg(hits, at_bats):
     return hits / at_bats if at_bats > 0 else None
 
 
-async def fetch_json(session, url, params=None):
-    try:
-        async with session.get(url, params=params, timeout=30) as resp:
-            if resp.status != 200:
-                logging.warning("HTTP %s for %s", resp.status, url)
-                return {}
-            return await resp.json()
-    except Exception as e:
-        logging.warning("Fetch error for %s: %s", url, e)
-        return {}
+async def fetch_json(session, sem, url, params=None):
+    async with sem:
+        try:
+            async with session.get(url, params=params, timeout=25) as resp:
+                if resp.status != 200:
+                    logging.warning("HTTP %s for %s", resp.status, url)
+                    return {}
+                return await resp.json()
+        except Exception as e:
+            logging.warning("Fetch error for %s: %s", url, e)
+            return {}
 
 
 def avg_from_games(games):
@@ -60,7 +63,7 @@ def avg_from_games(games):
     return calc_avg(hits, at_bats)
 
 
-async def fetch_season_stat(session, player_id, season_year):
+async def fetch_season_stat(session, sem, player_id, season_year):
     url = f"{MLB_API_BASE}/people/{player_id}/stats"
     params = {
         "stats": "season",
@@ -68,7 +71,7 @@ async def fetch_season_stat(session, player_id, season_year):
         "season": str(season_year),
     }
 
-    data = await fetch_json(session, url, params)
+    data = await fetch_json(session, sem, url, params)
     stats_list = data.get("stats", [])
     if not stats_list:
         return None
@@ -80,7 +83,7 @@ async def fetch_season_stat(session, player_id, season_year):
     return splits[0].get("stat", {})
 
 
-async def get_recent_team_games(session, team_id):
+async def get_recent_team_games(session, sem, team_id):
     end = datetime.utcnow()
     start = end - timedelta(days=LOOKBACK_DAYS)
 
@@ -92,7 +95,7 @@ async def get_recent_team_games(session, team_id):
         "endDate": end.strftime("%Y-%m-%d"),
     }
 
-    data = await fetch_json(session, url, params)
+    data = await fetch_json(session, sem, url, params)
 
     games = []
     for date_block in data.get("dates", []):
@@ -108,9 +111,9 @@ async def get_recent_team_games(session, team_id):
     return games[:25]
 
 
-async def fetch_boxscore(session, game_pk):
+async def fetch_boxscore(session, sem, game_pk):
     url = f"{MLB_API_BASE}/game/{game_pk}/boxscore"
-    return await fetch_json(session, url)
+    return await fetch_json(session, sem, url)
 
 
 def get_player_batting_from_boxscore(boxscore, player_id):
@@ -132,14 +135,17 @@ def get_player_batting_from_boxscore(boxscore, player_id):
     }
 
 
-async def process_team(session, team, season_year):
+async def process_team(session, sem, team, season_year, team_index, team_total):
+    global load_progress
+
     team_id = team["id"]
     team_abbr = team["abbreviation"]
 
-    logging.info("Loading team: %s", team_abbr)
+    load_progress = f"Loading {team_abbr} ({team_index}/{team_total})"
+    logging.info(load_progress)
 
     roster_url = f"{MLB_API_BASE}/teams/{team_id}/roster"
-    roster_data = await fetch_json(session, roster_url)
+    roster_data = await fetch_json(session, sem, roster_url)
     roster = roster_data.get("roster", [])
 
     batters = [
@@ -147,27 +153,22 @@ async def process_team(session, team, season_year):
         if p.get("position", {}).get("abbreviation") != "P"
     ]
 
-    recent_games = await get_recent_team_games(session, team_id)
+    recent_games = await get_recent_team_games(session, sem, team_id)
 
-    boxscores = await asyncio.gather(
-        *[fetch_boxscore(session, g["gamePk"]) for g in recent_games]
-    )
-
-    season_stats = await asyncio.gather(
-        *[
-            fetch_season_stat(session, p["person"]["id"], season_year)
-            for p in batters
-        ]
-    )
+    boxscores = []
+    for game in recent_games:
+        box = await fetch_boxscore(session, sem, game["gamePk"])
+        boxscores.append(box)
 
     team_players = []
 
-    for player, season_stat in zip(batters, season_stats):
-        if not season_stat:
-            continue
-
+    for player in batters:
         person = player["person"]
         player_id = person["id"]
+
+        season_stat = await fetch_season_stat(session, sem, player_id, season_year)
+        if not season_stat:
+            continue
 
         season_ab = int(season_stat.get("atBats", 0))
         season_hits = int(season_stat.get("hits", 0))
@@ -208,29 +209,42 @@ async def process_team(session, team, season_year):
 
 
 async def load_all_players():
-    global cached_players, cache_loaded, cache_loading, last_updated, last_load_error
+    global cached_players, cache_loaded, cache_loading, last_updated, last_load_error, load_progress
 
     with cache_lock:
         if cache_loading:
             logging.info("Load already in progress; skipping duplicate load.")
             return
         cache_loading = True
+        load_progress = "Starting MLB data refresh..."
 
     try:
         logging.info("Starting MLB data refresh...")
         season_year = datetime.utcnow().year
+        sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=180)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             teams_url = f"{MLB_API_BASE}/teams?sportId=1"
-            teams_data = await fetch_json(session, teams_url)
+            teams_data = await fetch_json(session, sem, teams_url)
             teams = teams_data.get("teams", [])
 
             if not teams:
                 raise RuntimeError("No teams returned from MLB API")
 
-            all_team_results = await asyncio.gather(
-                *[process_team(session, team, season_year) for team in teams]
-            )
+            all_team_results = []
+
+            for idx, team in enumerate(teams, start=1):
+                team_players = await process_team(
+                    session,
+                    sem,
+                    team,
+                    season_year,
+                    idx,
+                    len(teams)
+                )
+                all_team_results.append(team_players)
 
         players = []
         for team_players in all_team_results:
@@ -244,6 +258,7 @@ async def load_all_players():
             cache_loading = False
             last_updated = datetime.utcnow().isoformat() + "Z"
             last_load_error = None
+            load_progress = f"Loaded {len(players)} players."
 
         logging.info("Refresh complete. Loaded %s players.", len(players))
 
@@ -251,6 +266,7 @@ async def load_all_players():
         with cache_lock:
             cache_loading = False
             last_load_error = str(e)
+            load_progress = f"Load failed: {e}"
         logging.exception("MLB data refresh failed")
 
 
@@ -297,6 +313,7 @@ def api_players():
         loading = cache_loading
         error = last_load_error
         updated = last_updated
+        progress = load_progress
 
     if team:
         players = [p for p in players if p["team"] == team]
@@ -333,6 +350,7 @@ def api_players():
         "loading": loading,
         "last_load_error": error,
         "last_updated": updated,
+        "load_progress": progress,
         "count": len(players),
         "players": players,
         "teams": teams,
@@ -345,21 +363,16 @@ def healthz():
     ensure_loader_started()
 
     with cache_lock:
-        count = len(cached_players)
-        loaded = cache_loaded
-        loading = cache_loading
-        error = last_load_error
-        updated = last_updated
-
-    return jsonify({
-        "ok": True,
-        "loaded": loaded,
-        "loading": loading,
-        "players_loaded": count,
-        "loader_started": loader_started,
-        "last_updated": updated,
-        "last_load_error": error,
-    })
+        return jsonify({
+            "ok": True,
+            "loaded": cache_loaded,
+            "loading": cache_loading,
+            "players_loaded": len(cached_players),
+            "loader_started": loader_started,
+            "last_updated": last_updated,
+            "last_load_error": last_load_error,
+            "load_progress": load_progress,
+        })
 
 
 HTML_PAGE = """
@@ -380,7 +393,7 @@ tr:nth-child(even){ background:#2a2a2a; }
 tr:nth-child(odd){ background:#202020; }
 .muted { color:#bbb; font-size:.9em; }
 .error { color:#ffb3b3; font-size:.9em; }
-#playerPicker { min-width:260px; height:120px; }
+#playerPicker { min-width:220px; height:36px; }
 </style>
 </head>
 <body>
@@ -487,9 +500,7 @@ function loadPlayers() {
             }
 
             if (!data.loaded) {
-                statusText.textContent = data.loading
-                    ? "Data still loading... retrying."
-                    : "Data not loaded yet... retrying.";
+                statusText.textContent = data.load_progress || "Data still loading... retrying.";
                 setTimeout(loadPlayers, 3000);
                 return;
             }
