@@ -31,8 +31,8 @@ last_load_error = None
 load_progress = "Not started"
 
 cache_lock = threading.Lock()
-loader_lock = threading.Lock()
-loader_started = False
+refresh_thread = None
+refresh_thread_lock = threading.Lock()
 
 
 def format_avg(avg):
@@ -228,7 +228,7 @@ async def load_all_players():
         timeout = aiohttp.ClientTimeout(total=300)
         connector = aiohttp.TCPConnector(
             limit=MAX_CONCURRENT_REQUESTS,
-            family=socket.AF_INET
+            family=socket.AF_INET,
         )
 
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -279,34 +279,46 @@ async def load_all_players():
 
 def background_refresh_loop():
     while True:
+        time.sleep(REFRESH_SECONDS)
         try:
             asyncio.run(load_all_players())
         except Exception as e:
             logging.exception("Background refresh failed: %s", e)
 
-        time.sleep(REFRESH_SECONDS)
+
+def ensure_background_refresher_started():
+    global refresh_thread
+
+    with refresh_thread_lock:
+        if refresh_thread is None or not refresh_thread.is_alive():
+            logging.info("Starting background refresh thread...")
+            refresh_thread = threading.Thread(
+                target=background_refresh_loop,
+                daemon=True,
+            )
+            refresh_thread.start()
 
 
-def ensure_loader_started():
-    global loader_started
+def ensure_first_load_complete():
+    with cache_lock:
+        loaded = cache_loaded
+        loading = cache_loading
 
-    with loader_lock:
-        if not loader_started:
-            loader_started = True
-            logging.info("Starting background loader thread...")
-            threading.Thread(target=background_refresh_loop, daemon=True).start()
+    if not loaded and not loading:
+        logging.info("First request is triggering initial MLB data load...")
+        asyncio.run(load_all_players())
+        ensure_background_refresher_started()
 
 
 @app.route("/")
 def index():
-    ensure_loader_started()
     return HTML_PAGE
 
 
 @app.route("/api/players")
 @app.route("/api/player_stats")
 def api_players():
-    ensure_loader_started()
+    ensure_first_load_complete()
 
     team = request.args.get("team", "").strip()
     search = request.args.get("search", "").lower()
@@ -364,18 +376,16 @@ def api_players():
 
 @app.route("/healthz")
 def healthz():
-    ensure_loader_started()
-
     with cache_lock:
         return jsonify({
             "ok": True,
             "loaded": cache_loaded,
             "loading": cache_loading,
             "players_loaded": len(cached_players),
-            "loader_started": loader_started,
             "last_updated": last_updated,
             "last_load_error": last_load_error,
             "load_progress": load_progress,
+            "background_refresher_alive": refresh_thread is not None and refresh_thread.is_alive(),
         })
 
 
@@ -538,13 +548,16 @@ function loadPlayers() {
 }
 
 document.getElementById("applyBtn").addEventListener("click", loadPlayers);
+
 document.getElementById("clearPlayers").addEventListener("click", () => {
     Array.from(document.getElementById("playerPicker").options).forEach(o => o.selected = false);
     loadPlayers();
 });
+
 document.getElementById("search").addEventListener("keydown", e => {
     if (e.key === "Enter") loadPlayers();
 });
+
 document.querySelectorAll("th[data-sort]").forEach(th => {
     th.addEventListener("click", () => {
         const sort = th.dataset.sort;
@@ -562,8 +575,5 @@ loadPlayers();
 
 
 if __name__ == "__main__":
-    ensure_loader_started()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-else:
-    ensure_loader_started()
