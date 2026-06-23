@@ -1,412 +1,287 @@
-import requests
-import threading
 import asyncio
-import aiohttp
 import logging
+import threading
 import time
-import json
-import os
-from collections import defaultdict
-from flask import Flask, jsonify, render_template_string, send_file
-from io import StringIO, BytesIO
-import csv
+from datetime import datetime, timedelta
+from flask import Flask, render_template, jsonify, request
+import aiohttp
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+
+logging.basicConfig(
+    filename="dashboard.log",
+    level=logging.INFO,
+    format="[%(asctime)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
 MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
-MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
-MLB_BOXSCORE_URL = "https://statsapi.mlb.com/api/v1.1/game/{gamePk}/feed/live"
-
-CACHE_FILE = "cache.json"
+REFRESH_SECONDS = 6 * 60 * 60
+LOOKBACK_DAYS = 90
 
 cached_players = []
-blown_leads_cache = {}
-started = False
+cache_lock = threading.Lock()
 
-# =========================================================
-# CACHE
-# =========================================================
-def save_cache():
-    with open(CACHE_FILE, "w") as f:
-        json.dump({
-            "players": cached_players,
-            "blown": blown_leads_cache
-        }, f)
 
-def load_cache():
-    global cached_players, blown_leads_cache
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE) as f:
-            data = json.load(f)
-            cached_players = data.get("players", [])
-            blown_leads_cache = data.get("blown", {})
+def format_avg(avg):
+    if avg is None:
+        return ".000"
+    return ".%03d" % int(round(avg * 1000))
 
-# =========================================================
-# HELPERS
-# =========================================================
-async def fetch_json(session, url):
-    async with session.get(url) as resp:
-        return await resp.json()
 
-def compute_avg(games, n):
-    hits = sum(int(g.get("stat", {}).get("hits", 0)) for g in games[:n])
-    ab = sum(int(g.get("stat", {}).get("atBats", 0)) for g in games[:n])
-    return round(hits / ab, 3) if ab > 0 else 0.0
+def calc_avg(hits, ab):
+    return hits / ab if ab > 0 else None
 
-# =========================================================
-# PLAYERS
-# =========================================================
-async def fetch_player(session, player, team):
+
+async def fetch_json(session, url, params=None):
     try:
-        pid = player["person"]["id"]
-        name = player["person"]["fullName"]
+        async with session.get(url, params=params, timeout=30) as resp:
+            if resp.status != 200:
+                logging.warning(f"HTTP {resp.status} for {url}")
+                return {}
+            return await resp.json()
+    except Exception as e:
+        logging.warning(f"Fetch error for {url}: {e}")
+        return {}
 
-        season = await fetch_json(session, f"{MLB_API_BASE}/people/{pid}/stats?stats=season&season=2026")
-        stat = season["stats"][0]["splits"][0]["stat"] if season["stats"][0]["splits"] else {}
 
-        game_log = await fetch_json(session, f"{MLB_API_BASE}/people/{pid}/stats?stats=gameLog&season=2026")
-        games = game_log["stats"][0]["splits"]
+def avg_from_games(games):
+    hits = sum(int(g.get("hits", 0)) for g in games)
+    ab = sum(int(g.get("atBats", 0)) for g in games)
+    return calc_avg(hits, ab)
 
-        return {
-            "name": name,
-            "team": team["abbreviation"],
-            "league": team["league"]["name"],
-            "division": team["division"]["name"],
-            "season_avg": float(stat.get("avg", 0)),
-            "l5_avg": compute_avg(games, 5),
-            "l10_avg": compute_avg(games, 10),
-            "ab": int(stat.get("atBats", 0))
-        }
-    except:
+
+async def fetch_season_stat(session, player_id, season_year):
+    url = f"{MLB_API_BASE}/people/{player_id}/stats"
+    params = {
+        "stats": "season",
+        "group": "hitting",
+        "season": str(season_year)
+    }
+
+    data = await fetch_json(session, url, params)
+    stats_list = data.get("stats", [])
+
+    if not stats_list:
         return None
 
-async def load_players():
-    global cached_players
+    splits = stats_list[0].get("splits", [])
+    if not splits:
+        return None
+
+    return splits[0].get("stat", {})
+
+
+async def get_recent_team_games(session, team_id):
+    end = datetime.utcnow()
+    start = end - timedelta(days=LOOKBACK_DAYS)
+
+    url = f"{MLB_API_BASE}/schedule"
+    params = {
+        "sportId": 1,
+        "teamId": team_id,
+        "startDate": start.strftime("%Y-%m-%d"),
+        "endDate": end.strftime("%Y-%m-%d")
+    }
+
+    data = await fetch_json(session, url, params)
+
+    games = []
+    for date_block in data.get("dates", []):
+        for game in date_block.get("games", []):
+            status = game.get("status", {}).get("detailedState", "")
+            if status in ("Final", "Game Over", "Completed Early"):
+                games.append({
+                    "gamePk": game["gamePk"],
+                    "gameDate": game.get("gameDate", "")
+                })
+
+    games.sort(key=lambda g: g["gameDate"], reverse=True)
+    return games[:25]
+
+
+async def fetch_boxscore(session, game_pk):
+    url = f"{MLB_API_BASE}/game/{game_pk}/boxscore"
+    return await fetch_json(session, url)
+
+
+def get_player_batting_from_boxscore(boxscore, player_id):
+    teams = boxscore.get("teams", {})
+    all_players = {}
+
+    home_players = teams.get("home", {}).get("players", {})
+    away_players = teams.get("away", {}).get("players", {})
+
+    all_players.update(home_players)
+    all_players.update(away_players)
+
+    player_key = f"ID{player_id}"
+    player_data = all_players.get(player_key, {})
+    batting = player_data.get("stats", {}).get("batting")
+
+    if not batting:
+        return None
+
+    return {
+        "hits": int(batting.get("hits", 0)),
+        "atBats": int(batting.get("atBats", 0))
+    }
+
+
+async def process_team(session, team, season_year):
+    team_id = team["id"]
+    team_abbr = team["abbreviation"]
+    team_name = team.get("name", team_abbr)
+
+    logging.info(f"Loading team: {team_name}")
+
+    roster_url = f"{MLB_API_BASE}/teams/{team_id}/roster"
+    roster_data = await fetch_json(session, roster_url)
+    roster = roster_data.get("roster", [])
+
+    batters = [
+        p for p in roster
+        if p.get("position", {}).get("abbreviation") != "P"
+    ]
+
+    recent_games = await get_recent_team_games(session, team_id)
+    game_pks = [g["gamePk"] for g in recent_games]
+
+    boxscores = await asyncio.gather(
+        *[fetch_boxscore(session, game_pk) for game_pk in game_pks]
+    )
+
+    season_tasks = [
+        fetch_season_stat(session, p["person"]["id"], season_year)
+        for p in batters
+    ]
+    season_stats_list = await asyncio.gather(*season_tasks)
+
+    team_players = []
+
+    for player, season_stat in zip(batters, season_stats_list):
+        if not season_stat:
+            continue
+
+        person = player["person"]
+        player_id = person["id"]
+        name = person["fullName"]
+
+        season_ab = int(season_stat.get("atBats", 0))
+        season_hits = int(season_stat.get("hits", 0))
+        season_avg = calc_avg(season_hits, season_ab)
+
+        if season_ab < 50:
+            continue
+
+        recent_player_games = []
+
+        for box in boxscores:
+            batting = get_player_batting_from_boxscore(box, player_id)
+            if batting is not None:
+                recent_player_games.append(batting)
+
+            if len(recent_player_games) >= 10:
+                break
+
+        l5_games = recent_player_games[:5]
+        l10_games = recent_player_games[:10]
+
+        l5_avg = avg_from_games(l5_games)
+        l10_avg = avg_from_games(l10_games)
+
+        team_players.append({
+            "name": name,
+            "team": team_abbr,
+            "season_avg": season_avg,
+            "ab": season_ab,
+            "l5_avg": l5_avg,
+            "l10_avg": l10_avg,
+            "l5": format_avg(l5_avg),
+            "l10": format_avg(l10_avg),
+            "season": format_avg(season_avg),
+            "diff_l5": (l5_avg or 0) - (season_avg or 0),
+            "diff_l10": (l10_avg or 0) - (season_avg or 0)
+        })
+
+    logging.info(f"{team_abbr}: loaded {len(team_players)} players")
+    return team_players
+
+
+async def load_all_players():
+    logging.info("Starting MLB data refresh...")
+
+    season_year = datetime.utcnow().year
 
     async with aiohttp.ClientSession() as session:
-        teams = (await fetch_json(session, f"{MLB_API_BASE}/teams?sportId=1"))["teams"]
+        teams_url = f"{MLB_API_BASE}/teams?sportId=1"
+        teams_data = await fetch_json(session, teams_url)
+        teams = teams_data.get("teams", [])
 
-        players = []
-        for t in teams:
-            roster = (await fetch_json(session, f"{MLB_API_BASE}/teams/{t['id']}/roster"))["roster"]
+        all_team_results = await asyncio.gather(
+            *[process_team(session, team, season_year) for team in teams]
+        )
 
-            batters = [p for p in roster if p["position"]["abbreviation"] in
-                       ("1B","2B","3B","SS","LF","CF","RF","C","DH")]
+    players = []
+    for team_players in all_team_results:
+        players.extend(team_players)
 
-            tasks = [fetch_player(session, p, t) for p in batters]
-            results = await asyncio.gather(*tasks)
+    players.sort(key=lambda p: (p["team"], p["name"]))
 
-            players.extend([r for r in results if r])
-
+    with cache_lock:
+        global cached_players
         cached_players = players
-        save_cache()
 
-# =========================================================
-# BLOWN LEADS
-# =========================================================
-def get_games():
-    r = requests.get(MLB_SCHEDULE_URL, params={"sportId":1,"season":2026})
-    games=[]
-    for d in r.json().get("dates",[]):
-        for g in d["games"]:
-            if g["status"]["detailedState"]=="Final":
-                games.append(g)
-    return games
+    logging.info(f"Refresh complete. Loaded {len(players)} players.")
 
-def get_linescore(pk):
-    return requests.get(MLB_BOXSCORE_URL.format(gamePk=pk)).json()["liveData"]["linescore"]["innings"]
 
-def compute_blown():
-    blown=defaultdict(int)
-    for g in get_games():
-        try:
-            innings=get_linescore(g["gamePk"])
-            home=g["teams"]["home"]["team"]["name"]
-            away=g["teams"]["away"]["team"]["name"]
+def background_refresh_loop():
+    asyncio.run(load_all_players())
 
-            h=a=0
-            h_lead=a_lead=False
-
-            for i in innings:
-                h+=i.get("home",{}).get("runs",0)
-                a+=i.get("away",{}).get("runs",0)
-                if h>a: h_lead=True
-                if a>h: a_lead=True
-
-            if h_lead and h<a: blown[home]+=1
-            if a_lead and a<h: blown[away]+=1
-        except:
-            pass
-
-    return dict(sorted(blown.items(), key=lambda x:x[1], reverse=True))
-
-def blown_loop():
-    global blown_leads_cache
     while True:
-        blown_leads_cache = compute_blown()
-        save_cache()
-        time.sleep(21600)
+        time.sleep(REFRESH_SECONDS)
+        try:
+            asyncio.run(load_all_players())
+        except Exception as e:
+            logging.exception(f"Background refresh failed: {e}")
 
-# =========================================================
-# API
-# =========================================================
-@app.route("/api/players")
-def api_players():
-    return jsonify(cached_players)
-
-@app.route("/api/blown")
-def api_blown():
-    return jsonify(blown_leads_cache)
-
-# =========================================================
-# CSV
-# =========================================================
-@app.route("/export")
-def export():
-    si = StringIO()
-    writer = csv.writer(si)
-    writer.writerow(["Name","Team","Season","L5","L10","AB"])
-    for p in cached_players:
-        writer.writerow([p["name"],p["team"],p["season_avg"],p["l5_avg"],p["l10_avg"],p["ab"]])
-
-    output = BytesIO()
-    output.write(si.getvalue().encode())
-    output.seek(0)
-
-    return send_file(output, mimetype="text/csv", as_attachment=True, download_name="mlb.csv")
-
-# =========================================================
-# UI
-# =========================================================
-HOME_HTML = """
-<html>
-<head>
-<style>
-body { background:#181a1b; color:white; font-family:Arial; }
-table { border-collapse:collapse; width:100%; }
-th,td { border:1px solid #333; padding:6px; }
-th { cursor:pointer; background:#222; }
-input,select,button { margin:5px; padding:5px; }
-a { color:#66ccff; }
-</style>
-</head>
-
-<body>
-
-<h2>MLB Batting Dashboard v2.5</h2>
-
-<p style="max-width:900px; line-height:1.4;">
-Welcome to the MLB Slam Or Slump dashboard!! Here you can see batting averages for players overall,
-over their last 5 games and last 10 games. Click the column headers to sort and the dropdowns to
-select team, division and/or league, search players or make your own custom team. 
-There's also a link to the Blown Leads page right here:  <a href="/blown">Blown Leads</a><br>
-Lemme know how it works!! --Brent
-</p>
-
-<button onclick="exportCSV()">Export CSV</button>
-<button onclick="clearSelections()">CLEAR SELECTIONS</button><br>
-
-<select id="team" onchange="load()"></select>
-<select id="league" onchange="load()"></select>
-<select id="division" onchange="load()"></select>
-
-<input id="search" placeholder="Search players..." oninput="load()">
-<input id="addPlayer" placeholder="Add player (max 10)" oninput="suggest()">
-
-<div id="suggestions"></div>
-
-<table>
-<thead>
-<tr>
-<th onclick="sort('name')">Name</th>
-<th onclick="sort('team')">Team</th>
-<th onclick="sort('season_avg')">Season</th>
-<th onclick="sort('l5_avg')">L5</th>
-<th onclick="sort('l10_avg')">L10</th>
-<th onclick="sort('ab')">AB</th>
-</tr>
-</thead>
-<tbody id="body"></tbody>
-</table>
-
-<script>
-let data=[],field="season_avg",dir="desc",selected=[];
-
-function sort(f){
-    if(field===f) dir=dir==="asc"?"desc":"asc";
-    else {field=f;dir="desc";}
-    load();
-}
-
-function exportCSV(){ window.location="/export"; }
-
-function clearSelections(){
-    selected=[];
-    load();
-}
-
-function color(v,min,max){
-    let r=(v-min)/(max-min+0.0001);
-    return `rgb(${Math.floor(255*r)},0,${Math.floor(255*(1-r))})`;
-}
-
-async function init(){
-    let res=await fetch("/api/players");
-    data=await res.json();
-
-    let teams=[...new Set(data.map(p=>p.team))];
-    let leagues=[...new Set(data.map(p=>p.league))];
-    let divisions=[...new Set(data.map(p=>p.division))];
-
-    team.innerHTML="<option value=''>All Teams</option>"+teams.map(t=>`<option>${t}</option>`);
-    league.innerHTML="<option value=''>All Leagues</option>"+leagues.map(l=>`<option>${l}</option>`);
-    division.innerHTML="<option value=''>All Divisions</option>"+divisions.map(d=>`<option>${d}</option>`);
-
-    load();
-}
-
-function suggest(){
-    let q=addPlayer.value.toLowerCase();
-    if(!q){ suggestions.innerHTML=""; return; }
-
-    let matches=data.filter(p=>p.name.toLowerCase().includes(q)).slice(0,10);
-
-    suggestions.innerHTML=matches.map(p=>
-        `<div onclick="add('${p.name}')">${p.name}</div>`
-    ).join("");
-}
-
-function add(name){
-    if(selected.length>=10) return;
-    if(!selected.includes(name)) selected.push(name);
-    suggestions.innerHTML="";
-    addPlayer.value="";
-    load();
-}
-
-function load(){
-    let rows=[...data];
-
-    let s=search.value.toLowerCase();
-
-    rows=rows.filter(p=>
-        (!team.value||p.team===team.value) &&
-        (!league.value||p.league===league.value) &&
-        (!division.value||p.division===division.value) &&
-        (p.name.toLowerCase().includes(s)||p.team.toLowerCase().includes(s)) &&
-        (selected.length===0 || selected.includes(p.name))
-    );
-
-    rows.sort((a,b)=>{
-        let v1=a[field],v2=b[field];
-        if(typeof v1==="string") return dir==="asc"?v1.localeCompare(v2):v2.localeCompare(v1);
-        return dir==="asc"?v1-v2:v2-v1;
-    });
-
-    let l5=rows.map(p=>p.l5_avg);
-    let l10=rows.map(p=>p.l10_avg);
-
-    document.getElementById("body").innerHTML=
-        rows.map(p=>`<tr>
-        <td>${p.name}</td>
-        <td>${p.team}</td>
-        <td>${p.season_avg}</td>
-        <td style="background:${color(p.l5_avg,Math.min(...l5),Math.max(...l5))}">${p.l5_avg}</td>
-        <td style="background:${color(p.l10_avg,Math.min(...l10),Math.max(...l10))}">${p.l10_avg}</td>
-        <td>${p.ab}</td>
-        </tr>`).join("");
-}
-
-init();
-</script>
-
-</body>
-</html>
-"""
-
-BLOWN_HTML = """
-<html>
-<head>
-<style>
-body { background:#181a1b; color:white; font-family:Arial; }
-table { border-collapse:collapse; width:50%; }
-th,td { border:1px solid #333; padding:6px; }
-th { cursor:pointer; background:#222; }
-a { color:#66ccff; }
-</style>
-</head>
-
-<body>
-
-<h2>MLB Blown Leads v2.5</h2>
-
-<a href="/">Back</a>
-
-<table>
-<thead>
-<tr>
-<th onclick="sort('team')">Team</th>
-<th onclick="sort('value')">Blown Leads</th>
-</tr>
-</thead>
-<tbody id="body"></tbody>
-</table>
-
-<script>
-let data=[],field="value",dir="desc";
-
-function sort(f){
-    if(field===f) dir=dir==="asc"?"desc":"asc";
-    else {field=f;dir="desc";}
-    render();
-}
-
-async function init(){
-    let res=await fetch("/api/blown");
-    let raw=await res.json();
-    data=Object.entries(raw).map(([k,v])=>({team:k,value:v}));
-    render();
-}
-
-function render(){
-    data.sort((a,b)=>{
-        let v1=a[field],v2=b[field];
-        if(typeof v1==="string") return dir==="asc"?v1.localeCompare(v2):v2.localeCompare(v1);
-        return dir==="asc"?v1-v2:v2-v1;
-    });
-
-    document.getElementById("body").innerHTML =
-        data.map(r=>`<tr><td>${r.team}</td><td>${r.value}</td></tr>`).join("");
-}
-
-init();
-</script>
-
-</body>
-</html>
-"""
 
 @app.route("/")
-def home():
-    return render_template_string(HOME_HTML)
+def index():
+    with cache_lock:
+        teams = sorted(set(p["team"] for p in cached_players))
 
-@app.route("/blown")
-def blown():
-    return render_template_string(BLOWN_HTML)
+    return render_template("dashboard_shell.html", team_names=teams)
 
-# =========================================================
-# STARTUP
-# =========================================================
-load_cache()
 
-@app.before_request
-def start():
-    global started
-    if not started:
-        started=True
-        threading.Thread(target=lambda: asyncio.run(load_players()), daemon=True).start()
-        threading.Thread(target=blown_loop, daemon=True).start()
+@app.route("/api/player_stats")
+def api_player_stats():
+    team = request.args.get("team", "").strip()
+    search = request.args.get("search", "").lower()
+    sort = request.args.get("sort", "name")
+    dir_ = request.args.get("dir", "asc")
 
-if __name__ == "__main__":
-    app.run()
+    with cache_lock:
+        players = list(cached_players)
+
+    if team:
+        players = [p for p in players if p["team"] == team]
+
+    if search:
+        players = [p for p in players if search in p["name"].lower()]
+
+    def sort_key(p):
+        return {
+            "name": p["name"].lower(),
+            "team": p["team"],
+            "l5": p["l5_avg"] or 0,
+            "l10": p["l10_avg"] or 0,
+            "season": p["season_avg"] or 0,
+            "ab": p["ab"]
+        }.get(sort, p["name"].lower())
+
+    players.sort(key=sort_key, reverse=(dir_ == "desc"))
+    return jsonify(players)
+
+
+threading.Thread(target=background_refresh_loop, daemon=True).start()
