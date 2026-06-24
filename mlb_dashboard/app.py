@@ -1,3 +1,6 @@
+Understood. Here is the **complete `app.py`**. This version is Render-safe: it starts the MLB loader in a true background thread from the request path, does **not** block `/api/players`, shows partial results while loading, and includes `/healthz`.
+
+```python
 import asyncio
 import logging
 import os
@@ -21,7 +24,7 @@ logging.basicConfig(
 MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
 REFRESH_SECONDS = 6 * 60 * 60
 LOOKBACK_DAYS = 90
-MAX_CONCURRENT_REQUESTS = 8
+MAX_CONCURRENT_REQUESTS = 6
 
 cached_players = []
 cache_loaded = False
@@ -31,8 +34,8 @@ last_load_error = None
 load_progress = "Not started"
 
 cache_lock = threading.Lock()
-refresh_thread = None
-refresh_thread_lock = threading.Lock()
+loader_lock = threading.Lock()
+loader_thread = None
 
 
 def format_avg(avg):
@@ -113,7 +116,8 @@ async def get_recent_team_games(session, sem, team_id):
 
 
 async def fetch_boxscore(session, sem, game_pk):
-    return await fetch_json(session, sem, f"{MLB_API_BASE}/game/{game_pk}/boxscore")
+    url = f"{MLB_API_BASE}/game/{game_pk}/boxscore"
+    return await fetch_json(session, sem, url)
 
 
 def get_player_batting_from_boxscore(boxscore, player_id):
@@ -214,8 +218,8 @@ async def load_all_players():
         if cache_loading:
             logging.info("Load already in progress; skipping duplicate load.")
             return
+
         cache_loading = True
-        cache_loaded = False
         last_load_error = None
         load_progress = "Fetching MLB teams..."
 
@@ -225,7 +229,7 @@ async def load_all_players():
         season_year = datetime.utcnow().year
         sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-        timeout = aiohttp.ClientTimeout(total=300)
+        timeout = aiohttp.ClientTimeout(total=420)
         connector = aiohttp.TCPConnector(
             limit=MAX_CONCURRENT_REQUESTS,
             family=socket.AF_INET,
@@ -277,48 +281,42 @@ async def load_all_players():
         logging.exception("MLB data refresh failed")
 
 
-def background_refresh_loop():
+def loader_loop():
     while True:
-        time.sleep(REFRESH_SECONDS)
         try:
             asyncio.run(load_all_players())
         except Exception as e:
-            logging.exception("Background refresh failed: %s", e)
+            logging.exception("Loader loop failed: %s", e)
+
+        time.sleep(REFRESH_SECONDS)
 
 
-def ensure_background_refresher_started():
-    global refresh_thread
+def ensure_loader_started():
+    global loader_thread, load_progress
 
-    with refresh_thread_lock:
-        if refresh_thread is None or not refresh_thread.is_alive():
-            logging.info("Starting background refresh thread...")
-            refresh_thread = threading.Thread(
-                target=background_refresh_loop,
+    with loader_lock:
+        if loader_thread is None or not loader_thread.is_alive():
+            with cache_lock:
+                load_progress = "Starting MLB data refresh..."
+
+            logging.info("Starting MLB loader thread...")
+            loader_thread = threading.Thread(
+                target=loader_loop,
                 daemon=True,
             )
-            refresh_thread.start()
-
-
-def ensure_first_load_complete():
-    with cache_lock:
-        loaded = cache_loaded
-        loading = cache_loading
-
-    if not loaded and not loading:
-        logging.info("First request is triggering initial MLB data load...")
-        asyncio.run(load_all_players())
-        ensure_background_refresher_started()
+            loader_thread.start()
 
 
 @app.route("/")
 def index():
+    ensure_loader_started()
     return HTML_PAGE
 
 
 @app.route("/api/players")
 @app.route("/api/player_stats")
 def api_players():
-    ensure_first_load_complete()
+    ensure_loader_started()
 
     team = request.args.get("team", "").strip()
     search = request.args.get("search", "").lower()
@@ -376,6 +374,8 @@ def api_players():
 
 @app.route("/healthz")
 def healthz():
+    ensure_loader_started()
+
     with cache_lock:
         return jsonify({
             "ok": True,
@@ -385,7 +385,7 @@ def healthz():
             "last_updated": last_updated,
             "last_load_error": last_load_error,
             "load_progress": load_progress,
-            "background_refresher_alive": refresh_thread is not None and refresh_thread.is_alive(),
+            "loader_alive": loader_thread is not None and loader_thread.is_alive(),
         })
 
 
@@ -561,8 +561,12 @@ document.getElementById("search").addEventListener("keydown", e => {
 document.querySelectorAll("th[data-sort]").forEach(th => {
     th.addEventListener("click", () => {
         const sort = th.dataset.sort;
-        if (currentSort === sort) currentDir = currentDir === "asc" ? "desc" : "asc";
-        else { currentSort = sort; currentDir = "asc"; }
+        if (currentSort === sort) {
+            currentDir = currentDir === "asc" ? "desc" : "asc";
+        } else {
+            currentSort = sort;
+            currentDir = "asc";
+        }
         loadPlayers();
     });
 });
@@ -577,3 +581,4 @@ loadPlayers();
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+```
